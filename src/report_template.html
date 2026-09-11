@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>遍历报告 · __PACKAGE__</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --line:#272c37;
+  --tx:#e6e8ee; --dim:#8b93a7; --accent:#4f8cff;
+  --ok:#3ecf8e; --warn:#f5a623; --bad:#ff5f56; --purple:#af52de; --cyan:#22c1dc;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+  font-size:14px;line-height:1.6}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1280px;margin:0 auto;padding:24px 20px 64px}
+header.top{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:22px}
+h1{margin:0 0 6px;font-size:22px;letter-spacing:.3px}
+.sub{color:var(--dim);font-size:13px}
+.sub span{margin-right:16px;display:inline-block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:26px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card-t{color:var(--dim);font-size:12px}
+.card-v{font-size:26px;font-weight:600;margin:2px 0;line-height:1.2}
+.card-s{color:var(--dim);font-size:12px}
+.card.accent .card-v{color:var(--accent)}
+.card.ok .card-v{color:var(--ok)}
+.card.warn .card-v{color:var(--warn)}
+.card.bad .card-v{color:var(--bad)}
+h2{font-size:16px;margin:28px 0 12px;padding-left:9px;border-left:3px solid var(--accent)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.empty{color:var(--dim);padding:14px 4px}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{text-align:left;color:var(--dim);font-weight:500;padding:8px 10px;border-bottom:1px solid var(--line)}
+.tbl td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:12px}
+.dim{color:var(--dim)}
+.bar{display:inline-block;width:120px;height:6px;background:var(--panel2);border-radius:4px;overflow:hidden;vertical-align:middle;margin-right:8px}
+.bar-in{height:100%;border-radius:4px}
+.bar-in.ok{background:var(--ok)} .bar-in.warn{background:var(--warn)} .bar-in.bad{background:var(--bad)}
+.pct{font-size:12px;font-variant-numeric:tabular-nums}
+.pct.ok{color:var(--ok)} .pct.warn{color:var(--warn)} .pct.bad{color:var(--bad)}
+details.inc{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;background:var(--panel2);overflow:hidden}
+details.inc summary{cursor:pointer;padding:10px 12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.inc-sum{flex:1;min-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.inc-time{color:var(--dim);font-size:12px}
+.tag{font-size:11px;padding:2px 8px;border-radius:20px;font-weight:600;white-space:nowrap}
+.tag-crash{background:rgba(255,95,86,.16);color:var(--bad);border:1px solid rgba(255,95,86,.4)}
+.tag-anr{background:rgba(245,166,35,.16);color:var(--warn);border:1px solid rgba(245,166,35,.4)}
+.chip{font-size:11px;padding:2px 8px;border-radius:6px;background:var(--panel);border:1px solid var(--line);color:var(--dim)}
+.chip.new{color:var(--ok);border-color:rgba(62,207,142,.4);background:rgba(62,207,142,.12)}
+pre.stack{margin:0;padding:12px;background:#0b0d11;border-top:1px solid var(--line);
+  font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.5;
+  max-height:320px;overflow:auto;white-space:pre;color:#c9d1d9}
+.lnk{display:inline-block;margin:8px 12px 12px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.fbtn{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+  border-radius:20px;padding:5px 14px;cursor:pointer;font-size:12px}
+.fbtn.active{background:rgba(79,140,255,.16);border-color:rgba(79,140,255,.5);color:var(--accent)}
+.tl{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.step{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.t-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.t-idx{font-weight:700;color:var(--dim)}
+.t-kind{font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600}
+.k-click{background:rgba(255,95,86,.16);color:#ff5f56}
+.k-long_click{background:rgba(245,166,35,.16);color:#f5a623}
+.k-swipe{background:rgba(79,140,255,.16);color:#4f8cff}
+.k-input{background:rgba(175,82,222,.16);color:#af52de}
+.k-back,.k-key{background:rgba(139,147,167,.16);color:#8b93a7}
+.k-launch{background:rgba(62,207,142,.16);color:#3ecf8e}
+.t-time{margin-left:auto;color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+.t-body{display:flex;gap:12px;padding:12px}
+.shot{flex:0 0 96px;width:96px}
+.shot img{width:100%;display:block;border-radius:6px;border:1px solid var(--line);background:#000}
+.shot.none{flex:0 0 96px;height:150px;display:flex;align-items:center;justify-content:center;
+  color:var(--dim);font-size:12px;border:1px dashed var(--line);border-radius:6px}
+.t-main{min-width:0;flex:1}
+.t-label{word-break:break-all;margin-bottom:6px}
+.t-target{display:flex;gap:8px;align-items:center;margin-bottom:4px;flex-wrap:wrap}
+.t-act{margin-top:4px;font-size:12px;word-break:break-all}
+.t-err{margin-top:6px;color:var(--bad);font-size:12px}
+details.more{margin-top:14px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+details.more summary{cursor:pointer;color:var(--dim)}
+footer{margin-top:40px;color:var(--dim);font-size:12px;text-align:center;border-top:1px solid var(--line);padding-top:16px}
+@media(max-width:640px){.tl{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Android 智能遍历报告 · <span class="mono">__PACKAGE__</span></h1>
+    <div class="sub">
+      <span>设备：__DEVICE__</span>
+      <span>开始：__STARTED__</span>
+      <span>结束：__FINISHED__</span>
+      <span>时长：__DURATION__</span>
+    </div>
+  </header>
+
+  <div class="grid">__METRICS__</div>
+
+  <h2>异常（crash / ANR）</h2>
+  <div class="panel">__INCIDENTS__</div>
+
+  <h2>Activity 覆盖率</h2>
+  <div class="panel">
+    <table class="tbl">
+      <thead><tr><th>Activity</th><th class="num">访问次数</th><th class="num">首次进入</th>
+      <th class="num">可见控件</th><th class="num">已操作</th><th>控件覆盖率</th></tr></thead>
+      <tbody>__COVERAGE__</tbody>
+    </table>
+    __UNTOUCHED__
+  </div>
+
+  <h2>操作步骤时间线</h2>
+  <div class="filters">__FILTERS__</div>
+  <div class="tl">__TIMELINE__</div>
+
+  <footer>由 atraverse v__VERSION__ 生成 · 截图中标注了每步的操作位置与类型</footer>
+</div>
+<script>
+document.querySelectorAll('.fbtn').forEach(function(b){
+  b.addEventListener('click',function(){
+    document.querySelectorAll('.fbtn').forEach(function(x){x.classList.remove('active')});
+    b.classList.add('active');
+    var f=b.getAttribute('data-f');
+    document.querySelectorAll('.step').forEach(function(s){
+      s.style.display=(f==='all'||s.getAttribute('data-kind')===f)?'':'none';
+    });
+  });
+});
+</script>
+</body>
+</html>

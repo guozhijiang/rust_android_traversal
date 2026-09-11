@@ -1,0 +1,41 @@
+# 交叉编译配置模板 —— 请勿直接复制使用
+#
+# 这个文件只是说明结构，真正的 .cargo/config.toml 由脚本生成：
+#   Windows: powershell -ExecutionPolicy Bypass -File scripts/setup-cargo-config.ps1
+#   Linux/macOS: ./scripts/setup-cargo-config.sh
+#
+# 脚本会按 ANDROID_NDK_HOME -> $ANDROID_HOME/ndk/* -> 常见安装位置 探测 NDK，
+# 并把下面的 <NDK_ROOT> / <HOST_TAG> 替换成你本机的实际路径。
+#
+# 之所以不入库：config.toml 里必须是 NDK 的绝对路径，直接提交会把本机目录结构
+# 泄露到公开仓库，而且换台机器就失效。
+
+[target.aarch64-linux-android]
+ar = "<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/bin/llvm-ar"
+linker = "<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/bin/clang"
+rustflags = [
+  "-C", "link-arg=--target=aarch64-linux-android21",
+  "-C", "link-arg=--sysroot=<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/sysroot",
+  "-C", "link-arg=-fuse-ld=lld",
+]
+
+[target.armv7-linux-androideabi]
+ar = "<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/bin/llvm-ar"
+linker = "<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/bin/clang"
+rustflags = [
+  "-C", "link-arg=--target=armv7-linux-androideabi21",
+  "-C", "link-arg=--sysroot=<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/sysroot",
+  "-C", "link-arg=-fuse-ld=lld",
+]
+
+[target.x86_64-linux-android]
+ar = "<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/bin/llvm-ar"
+linker = "<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/bin/clang"
+rustflags = [
+  "-C", "link-arg=--target=x86_64-linux-android21",
+  "-C", "link-arg=--sysroot=<NDK_ROOT>/toolchains/llvm/prebuilt/<HOST_TAG>/sysroot",
+  "-C", "link-arg=-fuse-ld=lld",
+]
+
+# ABI 版本 21 = Android 5.0（NDK r27d 支持的最低版本）
+# Windows 上 ar/linker 需要带 .exe 后缀，脚本会自动处理。
