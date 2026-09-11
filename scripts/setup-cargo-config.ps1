@@ -17,6 +17,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# 读取环境变量：进程级优先，为空则回退到持久层（User → Machine）。
+# 刚设置完环境变量的终端，进程级 $env: 还是旧值，必须回退才能立刻生效。
+function Get-PersistedEnv {
+    param([string]$Name)
+    $v = [Environment]::GetEnvironmentVariable($Name)
+    if (-not $v) { $v = [Environment]::GetEnvironmentVariable($Name, "User") }
+    if (-not $v) { $v = [Environment]::GetEnvironmentVariable($Name, "Machine") }
+    return $v
+}
+
 function Resolve-NdkRoot {
     param([string]$Explicit)
 
@@ -24,12 +34,23 @@ function Resolve-NdkRoot {
     if ($Explicit) { return $Explicit }
 
     # 2) 环境变量
-    foreach ($v in @($env:ANDROID_NDK_HOME, $env:NDK_HOME, $env:ANDROID_NDK_ROOT)) {
+    #    先读进程级 $env:，为空时回退到持久层（User/Machine）。
+    #    这是因为刚用 setx / [Environment]::SetEnvironmentVariable 设完变量后，
+    #    当前已经打开的终端并不会自动刷新 $env:，但注册表里已经有了。
+    foreach ($name in @("ANDROID_NDK_HOME", "NDK_HOME", "ANDROID_NDK_ROOT")) {
+        $v = Get-PersistedEnv $name
         if ($v -and (Test-Path $v)) { return $v }
     }
 
+    # 2.1) 同上，ANDROID_HOME / ANDROID_SDK_ROOT 也允许来自持久层
+    $sdkList = @(
+        (Get-PersistedEnv "ANDROID_HOME"),
+        (Get-PersistedEnv "ANDROID_SDK_ROOT"),
+        "$env:LOCALAPPDATA/Android/Sdk"
+    )
+
     # 3) SDK 目录下的 ndk/<版本>，取版本号最大的
-    foreach ($sdk in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, "$env:LOCALAPPDATA/Android/Sdk")) {
+    foreach ($sdk in $sdkList) {
         if (-not $sdk) { continue }
         $ndkDir = Join-Path $sdk "ndk"
         if (Test-Path $ndkDir) {
