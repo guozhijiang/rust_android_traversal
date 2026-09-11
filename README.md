@@ -1,5 +1,7 @@
 # atraverse —— Android 应用智能遍历工具（Fastbot 形态）
 
+[![build](https://github.com/guozhijiang/rust_android_traversal/actions/workflows/build.yml/badge.svg)](https://github.com/guozhijiang/rust_android_traversal/actions/workflows/build.yml)
+
 用 Rust 写的 Android 应用自动遍历 / 稳定性测试工具。**主体以单个二进制的形式运行在手机上**
 （`adb shell /data/local/tmp/atraverse agent ...`），不依赖 PC 长连接，行为和 Fastbot 一致；
 同时提供一个 PC 端编排命令，负责交叉编译、部署、拉回结果和出报告。
@@ -72,6 +74,22 @@ cargo run -- build
 # 或手动
 cargo build --target aarch64-linux-android --release
 ```
+
+### 不想装 NDK：直接用 CI 编好的产物
+
+仓库配了 GitHub Actions（`.github/workflows/build.yml`）：
+
+- **push / PR** → 跑单元测试 + 交叉编译 3 个 ABI（`arm64-v8a` / `armeabi-v7a` / `x86_64`），
+  产物作为 workflow artifact 保留，在 Actions 页面直接下载
+- **push tag `v*`** → 额外自动建 GitHub Release，附 3 个二进制 + SHA256
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0   # 触发 Release
+```
+
+拿到二进制后按「方式一：手机端直接跑（推荐）」那节 push 到手机即可。
+CI 用的是 ubuntu runner + NDK r27d，与本地脚本同一套探测逻辑（仓库里的
+`scripts/setup-cargo-config.sh`），因此不会出现本地能编、CI 编不出来的情况。
 
 产物在 `target/aarch64-linux-android/release/atraverse`（已 strip，约 5.4MB）。
 

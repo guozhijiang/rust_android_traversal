@@ -1,0 +1,140 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 宿主机上跑单元测试（含 6MB 输出不死锁的回归用例）
+  test:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --release
+        run: cargo test --release
+
+  # 交叉编译三个 Android ABI。产物为静态链接的单文件二进制，
+  # push 到 /data/local/tmp 即可在手机上运行（无需 PC 长连接）。
+  build:
+    name: 交叉编译 ${{ matrix.abi }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+          - abi: armeabi-v7a
+            target: armv7-linux-androideabi
+          - abi: x86_64
+            target: x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 安装 Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27d
+          add-to-path: false
+
+      # .cargo/config.toml 含本机绝对路径、不入库；CI 里用仓库自带的
+      # 探测脚本按 ANDROID_NDK_HOME 现场生成（与本地开发同一套逻辑）。
+      - name: 生成 .cargo/config.toml
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          chmod +x scripts/setup-cargo-config.sh
+          ./scripts/setup-cargo-config.sh --force
+          sed -n '1,3p' .cargo/config.toml
+
+      - name: cargo build --release
+        run: cargo build --target ${{ matrix.target }} --release
+
+      - name: 校验产物格式
+        run: |
+          BIN="target/${{ matrix.target }}/release/atraverse"
+          file "$BIN"
+          # ELF + 正确的机器架构，避免编出宿主机产物却浑然不觉
+          file "$BIN" | grep -q "ELF" || { echo "产物不是 ELF，构建异常"; exit 1; }
+          ls -l "$BIN"
+
+      - name: 整理产物
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/atraverse" "dist/atraverse-${{ matrix.abi }}"
+          cp README.md dist/
+          (cd dist && sha256sum atraverse-${{ matrix.abi }} > "atraverse-${{ matrix.abi }}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atraverse-${{ matrix.abi }}
+          path: dist/
+          if-no-files-found: error
+
+  # 仅在 push tag（v*）时发布 Release
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 汇总产物与校验和
+        run: |
+          mkdir -p out
+          find artifacts -type f \( -name 'atraverse-*' -o -name '*.sha256' \) -exec cp {} out/ \;
+          cp artifacts/*/README.md out/ 2>/dev/null || true
+          cat out/*.sha256 > out/SHA256SUMS || true
+          ls -l out/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          # 不发 notes 自动生成，避免与其上方的说明表格互相覆盖
+          body: |
+            预编译的 atraverse 二进制，直接在 Android 设备上运行。
+
+            | 文件 | ABI | 适用设备 |
+            |---|---|---|
+            | `atraverse-arm64-v8a` | arm64-v8a | 绝大多数现代手机（推荐） |
+            | `atraverse-armeabi-v7a` | armeabi-v7a | 老款 32 位 ARM 设备 |
+            | `atraverse-x86_64` | x86_64 | 模拟器 / x86 设备 |
+
+            用法：
+
+            ```bash
+            adb push atraverse-arm64-v8a /data/local/tmp/atraverse
+            adb shell chmod 755 /data/local/tmp/atraverse
+            adb shell /data/local/tmp/atraverse agent --package com.example --duration 600
+            adb pull /sdcard/atraverse
+            ```
+
+            最低支持 Android 5.0（API 21）。
