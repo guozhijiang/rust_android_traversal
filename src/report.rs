@@ -193,10 +193,17 @@ fn build_html(s: &Session) -> String {
         if targets.is_empty() {
             html.push_str(r#"<div class="empty">可交互控件已全部操作过。</div>"#);
         } else {
+            // sample 只截前 50 个，数量对不上时说明一下
+            let more = if cov.untouched_interactive > targets.len() {
+                "（列出出现次数最多的 50 个）"
+            } else {
+                ""
+            };
             let _ = write!(
                 html,
-                r#"<details class="more" open><summary>还没被操作过的可交互控件（{} 个）</summary>{} {}</tbody></table></details>"#,
+                r#"<details class="more" open><summary>还没被操作过的可交互控件（{} 个{}）</summary>{} {}</tbody></table></details>"#,
                 cov.untouched_interactive,
+                more,
                 head,
                 targets.iter().map(|n| row(n)).collect::<String>()
             );
