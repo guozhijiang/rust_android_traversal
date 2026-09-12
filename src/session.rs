@@ -43,9 +43,9 @@ impl StepRecord {
         elapsed_ms: u64,
     ) -> Self {
         let (point, points, text) = match action {
-            Action::Click { point, .. } | Action::LongClick { point, .. } | Action::Input { point, .. } => {
-                (Some(*point), None, None)
-            }
+            Action::Click { point, .. }
+            | Action::LongClick { point, .. }
+            | Action::Input { point, .. } => (Some(*point), None, None),
             Action::Swipe { from, to, .. } => (None, Some([*from, *to]), None),
             _ => (None, None, None),
         };
@@ -95,6 +95,13 @@ pub struct RunConfig {
     pub seed: u64,
     pub screenshot: bool,
     pub annotate: bool,
+    /// 状态指纹取法："structural"（默认，抵抗动态文本）或 "exact"
+    #[serde(default = "default_state_mode")]
+    pub state_mode: String,
+}
+
+fn default_state_mode() -> String {
+    "structural".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +126,12 @@ impl Session {
     pub fn crash_count(&self) -> usize {
         self.incidents
             .iter()
-            .filter(|i| matches!(i.kind, crate::monitor::IncidentKind::Crash | crate::monitor::IncidentKind::NativeCrash))
+            .filter(|i| {
+                matches!(
+                    i.kind,
+                    crate::monitor::IncidentKind::Crash | crate::monitor::IncidentKind::NativeCrash
+                )
+            })
             .count()
     }
     pub fn anr_count(&self) -> usize {

@@ -88,7 +88,11 @@ pub fn capture_output(cmd: &mut Command, timeout: Duration) -> Result<Output> {
         if let Some(status) = child.try_wait()? {
             let stdout = h_out.join().unwrap_or_default();
             let stderr = h_err.join().unwrap_or_default();
-            return Ok(Output { status, stdout, stderr });
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         if start.elapsed() > timeout {
             let _ = child.kill();
@@ -114,8 +118,8 @@ pub fn sdk_int<D: Device + ?Sized>(d: &D) -> i32 {
 
 pub fn screen_size<D: Device + ?Sized>(d: &D) -> Result<(i32, i32)> {
     let out = d.sh("wm size", DEFAULT_TIMEOUT)?;
-    let line = out.lines().last().unwrap_or("");
-    let dim = line.split(':').last().unwrap_or("").trim();
+    let line = out.lines().next_back().unwrap_or("");
+    let dim = line.split(':').next_back().unwrap_or("").trim();
     let mut it = dim.split('x');
     let w: i32 = it.next().unwrap_or("0").trim().parse().unwrap_or(0);
     let h: i32 = it.next().unwrap_or("0").trim().parse().unwrap_or(0);
@@ -179,7 +183,9 @@ fn extract_component(seg: &str) -> Option<String> {
 /// 解析 LAUNCHER Activity
 pub fn resolve_launcher<D: Device + ?Sized>(d: &D, package: &str) -> Option<String> {
     let out = d.sh_quiet(&format!("cmd package resolve-activity --brief {}", package));
-    out.lines().filter(|l| l.contains('/')).last().map(|l| l.trim().to_string())
+    out.lines()
+        .rfind(|l| l.contains('/'))
+        .map(|l| l.trim().to_string())
 }
 
 pub fn force_stop<D: Device + ?Sized>(d: &D, package: &str) -> Result<()> {
@@ -190,9 +196,15 @@ pub fn force_stop<D: Device + ?Sized>(d: &D, package: &str) -> Result<()> {
 pub fn launch<D: Device + ?Sized>(d: &D, package: &str, component: Option<&str>) -> Result<String> {
     let comp = match component {
         Some(c) => c.to_string(),
-        None => resolve_launcher(d, package).unwrap_or_else(|| format!("{}/.MainActivity", package)),
+        None => {
+            resolve_launcher(d, package).unwrap_or_else(|| format!("{}/.MainActivity", package))
+        }
     };
-    let comp = if comp.contains('/') { comp } else { format!("{}/{}", package, comp) };
+    let comp = if comp.contains('/') {
+        comp
+    } else {
+        format!("{}/{}", package, comp)
+    };
     d.sh(&format!("am start -n {} -W", comp), DEFAULT_TIMEOUT)?;
     Ok(comp)
 }
@@ -230,7 +242,14 @@ pub fn input_long_press<D: Device + ?Sized>(d: &D, x: i32, y: i32, ms: u32) -> R
     Ok(())
 }
 
-pub fn input_swipe<D: Device + ?Sized>(d: &D, x1: i32, y1: i32, x2: i32, y2: i32, ms: u32) -> Result<()> {
+pub fn input_swipe<D: Device + ?Sized>(
+    d: &D,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    ms: u32,
+) -> Result<()> {
     d.sh(
         &format!("input swipe {} {} {} {} {}", x1, y1, x2, y2, ms),
         DEFAULT_TIMEOUT,
@@ -297,7 +316,11 @@ impl DeviceInfo {
             self.width,
             self.height,
             self.abi,
-            if self.serial.is_empty() { "本机" } else { &self.serial }
+            if self.serial.is_empty() {
+                "本机"
+            } else {
+                &self.serial
+            }
         )
     }
 }
@@ -320,7 +343,10 @@ mod tests {
     #[test]
     fn parses_resumed_activity() {
         let s = "topResumedActivity=ActivityRecord{8f2c1 u0 com.demo.app/.ui.MainActivity t42}";
-        assert_eq!(parse_resumed_activity(s).unwrap(), "com.demo.app/.ui.MainActivity");
+        assert_eq!(
+            parse_resumed_activity(s).unwrap(),
+            "com.demo.app/.ui.MainActivity"
+        );
     }
 
     #[test]
@@ -356,7 +382,11 @@ mod tests {
             c
         };
         let out = capture_output(&mut c, Duration::from_secs(30)).expect("大输出被卡死");
-        assert!(out.stdout.len() > 4_000_000, "输出被截断: {} 字节", out.stdout.len());
+        assert!(
+            out.stdout.len() > 4_000_000,
+            "输出被截断: {} 字节",
+            out.stdout.len()
+        );
 
         let _ = std::fs::remove_file(&f);
         let _ = std::fs::remove_dir_all(&dir);

@@ -48,38 +48,25 @@ pub fn parse_hierarchy(xml: &str) -> Result<Hierarchy> {
             continue;
         }
 
-        let (name, rest) = if raw.starts_with('/') {
-            // 闭合标签
-            (&raw[1..], "")
-        } else {
-            let self_closing = raw.ends_with('/');
-            let body = if self_closing { raw.trim_end_matches('/') } else { raw };
-            let mut it = body.splitn(2, char::is_whitespace);
-            let n = it.next().unwrap_or("");
-            let r = it.next().unwrap_or("");
-            if self_closing {
-                (n, r)
-            } else {
-                // 用 (name, attrs, is_close=false) 的形态继续处理
-                (n, r)
-            }
-        };
         let is_close = raw.starts_with('/');
         let self_closing = !is_close && raw.ends_with('/');
+        let body = raw.strip_prefix('/').unwrap_or(raw);
+        let body = body.strip_suffix('/').unwrap_or(body);
+        let mut it = body.splitn(2, char::is_whitespace);
+        let name = it.next().unwrap_or("");
+        let rest = it.next().unwrap_or("");
 
         match name {
-            "hierarchy" => {
-                if !is_close {
-                    let attrs = parse_attrs(rest);
-                    if let Some(v) = attrs.get("width") {
-                        h.width = v.parse().unwrap_or(0);
-                    }
-                    if let Some(v) = attrs.get("height") {
-                        h.height = v.parse().unwrap_or(0);
-                    }
-                    if let Some(v) = attrs.get("rotation") {
-                        h.rotation = v.parse().unwrap_or(0);
-                    }
+            "hierarchy" if !is_close => {
+                let attrs = parse_attrs(rest);
+                if let Some(v) = attrs.get("width") {
+                    h.width = v.parse().unwrap_or(0);
+                }
+                if let Some(v) = attrs.get("height") {
+                    h.height = v.parse().unwrap_or(0);
+                }
+                if let Some(v) = attrs.get("rotation") {
+                    h.rotation = v.parse().unwrap_or(0);
                 }
             }
             "node" => {
@@ -130,26 +117,30 @@ pub fn parse_hierarchy(xml: &str) -> Result<Hierarchy> {
 
 fn node_from_attrs(rest: &str) -> UiNode {
     let attrs = parse_attrs(rest);
-    let mut n = UiNode::default();
-    n.index = attrs.get("index").and_then(|v| v.parse().ok()).unwrap_or(0);
-    n.text = attrs.get("text").cloned().unwrap_or_default();
-    n.resource_id = attrs.get("resource-id").cloned().unwrap_or_default();
-    n.class = attrs.get("class").cloned().unwrap_or_default();
-    n.package = attrs.get("package").cloned().unwrap_or_default();
-    n.content_desc = attrs.get("content-desc").cloned().unwrap_or_default();
-    n.bounds = attrs.get("bounds").and_then(|v| Rect::parse(v)).unwrap_or_default();
-    n.clickable = attr_bool(&attrs, "clickable");
-    n.long_clickable = attr_bool(&attrs, "long-clickable");
-    n.scrollable = attr_bool(&attrs, "scrollable");
-    n.checkable = attr_bool(&attrs, "checkable");
-    n.checked = attr_bool(&attrs, "checked");
-    // 缺省视为可用：部分设备的 dump 不输出 enabled 属性，
-    // 若默认 false 会把整棵树都当成 disabled 而过滤掉（实测会吞掉全部候选动作）
-    n.enabled = attrs.get("enabled").map(|v| v == "true").unwrap_or(true);
-    n.focused = attr_bool(&attrs, "focused");
-    n.selected = attr_bool(&attrs, "selected");
-    n.password = attr_bool(&attrs, "password");
-    n
+    UiNode {
+        index: attrs.get("index").and_then(|v| v.parse().ok()).unwrap_or(0),
+        text: attrs.get("text").cloned().unwrap_or_default(),
+        resource_id: attrs.get("resource-id").cloned().unwrap_or_default(),
+        class: attrs.get("class").cloned().unwrap_or_default(),
+        package: attrs.get("package").cloned().unwrap_or_default(),
+        content_desc: attrs.get("content-desc").cloned().unwrap_or_default(),
+        bounds: attrs
+            .get("bounds")
+            .and_then(|v| Rect::parse(v))
+            .unwrap_or_default(),
+        clickable: attr_bool(&attrs, "clickable"),
+        long_clickable: attr_bool(&attrs, "long-clickable"),
+        scrollable: attr_bool(&attrs, "scrollable"),
+        checkable: attr_bool(&attrs, "checkable"),
+        checked: attr_bool(&attrs, "checked"),
+        // 缺省视为可用：部分设备的 dump 不输出 enabled 属性，
+        // 若默认 false 会把整棵树都当成 disabled 而过滤掉（实测会吞掉全部候选动作）
+        enabled: attrs.get("enabled").map(|v| v == "true").unwrap_or(true),
+        focused: attr_bool(&attrs, "focused"),
+        selected: attr_bool(&attrs, "selected"),
+        password: attr_bool(&attrs, "password"),
+        ..Default::default()
+    }
 }
 
 fn attr_bool(attrs: &std::collections::HashMap<String, String>, k: &str) -> bool {
@@ -250,7 +241,10 @@ fn unescape(s: &str) -> String {
             "quot" => out.push('"'),
             "apos" => out.push('\''),
             other => {
-                if let Some(hex) = other.strip_prefix("#x").or_else(|| other.strip_prefix("#X")) {
+                if let Some(hex) = other
+                    .strip_prefix("#x")
+                    .or_else(|| other.strip_prefix("#X"))
+                {
                     if let Ok(v) = u32::from_str_radix(hex, 16) {
                         if let Some(ch) = char::from_u32(v) {
                             out.push(ch);

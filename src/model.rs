@@ -160,7 +160,11 @@ pub struct UiNode {
 
 impl UiNode {
     pub fn short_class(&self) -> String {
-        self.class.rsplit('.').next().unwrap_or(&self.class).to_string()
+        self.class
+            .rsplit('.')
+            .next()
+            .unwrap_or(&self.class)
+            .to_string()
     }
 
     /// 简短可读标识，用于日志与报告
@@ -195,10 +199,32 @@ impl UiNode {
             || self.is_edit_text()
     }
 
+    /// 是否计入「可交互控件覆盖率」的分母。
+    ///
+    /// 比 [`interactive`](Self::interactive) 宽一点：把有文本/描述的叶子节点也算进来
+    /// （这类节点自身不可点击，但点击会冒泡到父容器，属于有效操作目标）；
+    /// 但排除 FrameLayout 这类既不可交互、又没有任何内容的纯布局容器 ——
+    /// 它们永远不会被点击，算进分母只会让覆盖率永远到不了 100%，指标失真。
+    pub fn coverage_target(&self) -> bool {
+        self.interactive() || self.is_leaf_with_content()
+    }
+
     /// 有内容但自身不可点击的叶子节点（例如列表项容器内的文本），
     /// 点击通常会冒泡到父级 clickable，是提高覆盖率的重要补充。
     pub fn is_leaf_with_content(&self) -> bool {
         self.children.is_empty() && (!self.text.is_empty() || !self.content_desc.is_empty())
+    }
+
+    /// 状态指纹专用的稳定身份：**不含文本**。
+    ///
+    /// 与 [`key`](Self::key) 的区别在于兜底分支：`key()` 在无 resource-id 时会退到
+    /// `class + 文本`，于是时钟、电量、倒计时这类动态文本会让身份每帧都变，
+    /// 状态指纹跟着抖。这里退到 `class + 位置`，位置不变则身份不变。
+    pub fn struct_key(&self) -> String {
+        if !self.resource_id.is_empty() {
+            return self.resource_id.clone();
+        }
+        format!("{}#{}", self.short_class(), self.bounds)
     }
 
     /// 稳定身份：优先 resource-id，其次 class+文本，最后 class+位置
@@ -278,6 +304,14 @@ impl Hierarchy {
         }
     }
 
+    /// 节点总数（不分配中间 Vec 的计数）
+    pub fn node_count(&self) -> usize {
+        fn rec(n: &UiNode) -> usize {
+            1 + n.children.iter().map(rec).sum::<usize>()
+        }
+        self.root.as_ref().map(rec).unwrap_or(0)
+    }
+
     /// 可见（在屏幕内且有面积）的节点
     pub fn visible_nodes(&self) -> Vec<&UiNode> {
         let screen = self.screen();
@@ -287,12 +321,37 @@ impl Hierarchy {
             .collect()
     }
 
-    /// 状态指纹：交互控件的内容签名集合 + 全屏文本集合
-    pub fn state_sig(&self, activity: &str) -> String {
-        let screen = self.screen();
+    /// 状态指纹：交互控件的内容签名集合 + 全屏文本集合。
+    /// `visible` 需为 `visible_nodes()` 的结果，屏幕尺寸参与签名以避免旋转/分屏造成的坐标误解
+    /// 结构签名（状态指纹的结构部分）：只由**可交互控件的身份**构成，不含文本内容。
+    ///
+    /// 用它做状态去重可以抵抗动态文本——时间、电量、进度百分比、推荐流内容这类
+    /// 每屏都在变的东西，否则每一步都会被判成「新状态」，后果是：
+    ///   1. 同一页面上的控件被反复当作「未探索动作」点击，白白消耗步数；
+    ///   2. 卡死检测（连续 N 步停留在同一状态）永远无法触发，死循环时出不来。
+    pub fn struct_sig_with(activity: &str, screen: &Rect, visible: &[&UiNode]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for n in visible {
+            if n.coverage_target() {
+                parts.push(format!("{}|{}", n.struct_key(), n.checked));
+            }
+        }
+        parts.sort();
+        parts.dedup();
+        format!(
+            "{}|{}x{}|{}",
+            activity,
+            screen.w(),
+            screen.h(),
+            parts.join(";")
+        )
+    }
+
+    /// 完整内容签名：在结构签名之外还算进所有文本（旧行为，见 `StateMode::Exact`）
+    pub fn state_sig_with(activity: &str, screen: &Rect, visible: &[&UiNode]) -> String {
         let mut inter: Vec<String> = Vec::new();
         let mut texts: Vec<String> = Vec::new();
-        for n in self.visible_nodes() {
+        for n in visible {
             if n.interactive() || n.is_leaf_with_content() {
                 inter.push(n.content_sig());
             }
@@ -305,7 +364,14 @@ impl Hierarchy {
         texts.sort();
         texts.dedup();
         // 屏幕尺寸参与签名，避免旋转/分屏造成的坐标误解
-        format!("{}|{}x{}|{}|{}", activity, screen.w(), screen.h(), inter.join(";"), texts.join(";"))
+        format!(
+            "{}|{}x{}|{}|{}",
+            activity,
+            screen.w(),
+            screen.h(),
+            inter.join(";"),
+            texts.join(";")
+        )
     }
 }
 
@@ -367,13 +433,34 @@ impl SwipeDir {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Action {
-    Launch { component: String },
+    Launch {
+        component: String,
+    },
     Back,
-    Key { code: i32, name: String },
-    Click { target: TargetInfo, point: (i32, i32) },
-    LongClick { target: TargetInfo, point: (i32, i32) },
-    Swipe { target: Option<TargetInfo>, from: (i32, i32), to: (i32, i32), dir: SwipeDir, duration_ms: u32 },
-    Input { target: TargetInfo, point: (i32, i32), text: String },
+    Key {
+        code: i32,
+        name: String,
+    },
+    Click {
+        target: TargetInfo,
+        point: (i32, i32),
+    },
+    LongClick {
+        target: TargetInfo,
+        point: (i32, i32),
+    },
+    Swipe {
+        target: Option<TargetInfo>,
+        from: (i32, i32),
+        to: (i32, i32),
+        dir: SwipeDir,
+        duration_ms: u32,
+    },
+    Input {
+        target: TargetInfo,
+        point: (i32, i32),
+        text: String,
+    },
 }
 
 impl Action {
@@ -408,10 +495,23 @@ impl Action {
             Action::Launch { component } => format!("启动 {}", component),
             Action::Back => "返回键".to_string(),
             Action::Key { name, .. } => format!("按键 {}", name),
-            Action::Click { target, point } => format!("点击 {} @({},{})", target.label, point.0, point.1),
-            Action::LongClick { target, point } => format!("长按 {} @({},{})", target.label, point.0, point.1),
-            Action::Swipe { target, from, to, dir, .. } => {
-                let who = target.as_ref().map(|t| t.label.clone()).unwrap_or_else(|| "屏幕".to_string());
+            Action::Click { target, point } => {
+                format!("点击 {} @({},{})", target.label, point.0, point.1)
+            }
+            Action::LongClick { target, point } => {
+                format!("长按 {} @({},{})", target.label, point.0, point.1)
+            }
+            Action::Swipe {
+                target,
+                from,
+                to,
+                dir,
+                ..
+            } => {
+                let who = target
+                    .as_ref()
+                    .map(|t| t.label.clone())
+                    .unwrap_or_else(|| "屏幕".to_string());
                 format!(
                     "{} {} ({},{})->({},{})",
                     dir.cn(),
@@ -436,7 +536,10 @@ impl Action {
             Action::LongClick { target, .. } => format!("long_click#{}", target.key),
             Action::Swipe { target, dir, .. } => format!(
                 "swipe#{}#{}",
-                target.as_ref().map(|t| t.key.clone()).unwrap_or_else(|| "screen".to_string()),
+                target
+                    .as_ref()
+                    .map(|t| t.key.clone())
+                    .unwrap_or_else(|| "screen".to_string()),
                 dir.as_str()
             ),
             Action::Input { target, text, .. } => format!("input#{}#{}", target.key, text),
@@ -449,7 +552,9 @@ impl Action {
             Action::Click { target, .. }
             | Action::LongClick { target, .. }
             | Action::Input { target, .. } => Some(target.key.clone()),
-            Action::Swipe { target: Some(t), .. } => Some(t.key.clone()),
+            Action::Swipe {
+                target: Some(t), ..
+            } => Some(t.key.clone()),
             _ => None,
         }
     }

@@ -23,7 +23,12 @@ pub fn elapsed_ms(start: Instant) -> u64 {
 pub fn fmt_duration(ms: u64) -> String {
     let secs = ms / 1000;
     if secs >= 3600 {
-        format!("{:02}h{:02}m{:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{:02}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     } else if secs >= 60 {
         format!("{:02}m{:02}s", secs / 60, secs % 60)
     } else {
@@ -71,9 +76,7 @@ pub fn hash64<T: Hash>(v: &T) -> u64 {
 pub fn slug(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-        } else if c == '-' || c == '_' {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
             out.push(c);
         } else if c == '.' || c == ':' || c == '/' {
             out.push('_');

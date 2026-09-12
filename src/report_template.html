@@ -40,6 +40,8 @@ h2{font-size:16px;margin:28px 0 12px;padding-left:9px;border-left:3px solid var(
 .num{text-align:right;font-variant-numeric:tabular-nums}
 .mono{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:12px}
 .dim{color:var(--dim)}
+.hint{margin:0 0 14px;color:var(--dim);font-size:13px;line-height:1.7}
+.hint b{color:var(--tx);font-weight:600}
 .bar{display:inline-block;width:120px;height:6px;background:var(--panel2);border-radius:4px;overflow:hidden;vertical-align:middle;margin-right:8px}
 .bar-in{height:100%;border-radius:4px}
 .bar-in.ok{background:var(--ok)} .bar-in.warn{background:var(--warn)} .bar-in.bad{background:var(--bad)}
@@ -108,10 +110,13 @@ footer{margin-top:40px;color:var(--dim);font-size:12px;text-align:center;border-
   <div class="panel">__INCIDENTS__</div>
 
   <h2>Activity 覆盖率</h2>
+  <p class="hint">覆盖率口径为<b>可交互控件</b>：可点击 / 可长按 / 可勾选 / 可滚动 / 输入框，以及带文本的叶子节点。
+  FrameLayout 这类纯布局容器不可能被点到，不计入分母——算进去只会让数字永远到不了 100%。
+  「全部节点」列同时给出含容器的宽口径，便于对照。</p>
   <div class="panel">
     <table class="tbl">
       <thead><tr><th>Activity</th><th class="num">访问次数</th><th class="num">首次进入</th>
-      <th class="num">可见控件</th><th class="num">已操作</th><th>控件覆盖率</th></tr></thead>
+      <th class="num">已操作 / 可交互</th><th class="num">全部节点</th><th>可交互覆盖率</th></tr></thead>
       <tbody>__COVERAGE__</tbody>
     </table>
     __UNTOUCHED__

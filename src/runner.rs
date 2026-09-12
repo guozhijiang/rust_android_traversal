@@ -6,11 +6,14 @@ use crate::annotate::{annotate_png, markers_for_action, write_thumbnail, Marker}
 use crate::device::{self, Device, DeviceInfo};
 use crate::dump::parse_hierarchy;
 use crate::model::{Action, Hierarchy};
-use crate::monitor::{collect_anr_traces, collect_dropbox, collect_tombstones, Incident, IncidentKind, LogcatMonitor};
+use crate::monitor::{
+    collect_anr_traces, collect_dropbox, collect_tombstones, Incident, IncidentKind, LogcatMonitor,
+};
 use crate::session::{append_step, write_session, RunConfig, Session, StepRecord};
-use crate::strategy::{Explorer, ExplorerConfig};
+use crate::strategy::{Explorer, ExplorerConfig, StateMode};
 use crate::util::{elapsed_ms, ensure_dir, now_file_str, now_str, slug};
 use anyhow::{bail, Context, Result};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,6 +34,8 @@ pub struct RunOptions {
     pub keep_raw: bool,
     pub text_pool: Vec<String>,
     pub max_same_state: usize,
+    /// 状态指纹取法（结构优先 / 内容精确）
+    pub state_mode: StateMode,
     pub max_relaunch: usize,
     pub verbose: bool,
     pub stop: Arc<AtomicBool>,
@@ -45,7 +50,14 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
     let pkg = opts.package.clone();
     let info = DeviceInfo::fetch(dev, "")?;
     println!("[设备] {}", info.display());
-    println!("[模式] {}", if dev.kind() == "device" { "设备端（运行在手机上）" } else { "PC 端（adb 转发）" });
+    println!(
+        "[模式] {}",
+        if dev.kind() == "device" {
+            "设备端（运行在手机上）"
+        } else {
+            "PC 端（adb 转发）"
+        }
+    );
 
     // ---------------- 目录准备
     let dir = opts.output.clone();
@@ -82,6 +94,7 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
             opts.text_pool.clone()
         },
         max_same_state: opts.max_same_state.max(2),
+        state_mode: opts.state_mode,
         ..Default::default()
     };
     let mut ex = Explorer::new(cfg, opts.seed);
@@ -103,9 +116,7 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
 
     println!(
         "[开始遍历] 目标 {} · 最长 {}s · 最多 {} 步",
-        pkg,
-        opts.duration_secs,
-        opts.max_steps
+        pkg, opts.duration_secs, opts.max_steps
     );
 
     while !opts.stop.load(Ordering::SeqCst) {
@@ -163,7 +174,10 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
             if away_count >= 4 {
                 away_count = 0;
                 if relaunches >= opts.max_relaunch {
-                    println!("[结束] 重启次数达到上限（{}），应用可能无法保持在前台", opts.max_relaunch);
+                    println!(
+                        "[结束] 重启次数达到上限（{}），应用可能无法保持在前台",
+                        opts.max_relaunch
+                    );
                     break;
                 }
                 relaunches += 1;
@@ -231,7 +245,10 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
         };
         let action = if ex.is_stuck() && !matches!(action, Action::Back) {
             if opts.verbose {
-                println!("[策略] 连续 {} 次停留在同一状态，强制返回", ex.same_streak());
+                println!(
+                    "[策略] 连续 {} 次停留在同一状态，强制返回",
+                    ex.same_streak()
+                );
             }
             ex.reset_streak();
             Action::Back
@@ -283,22 +300,30 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
                             &png,
                         );
                     }
-                    let markers = scale_markers(markers_for_action(&action, step_index), &hier, &png);
-                    match finalize_png(&png, &markers, opts.annotate) {
-                        Ok(out) => {
-                            let name = format!("step_{:04}_{}.png", step_index, action.kind());
-                            let p = shot_dir.join(&name);
-                            if std::fs::write(&p, &out).is_ok() {
-                                rec.screenshot = Some(format!("screenshots/{}", name));
-                                let tp = thumb_dir.join(&name);
-                                if write_thumbnail(&out, &tp, 260, 460).is_ok() {
-                                    rec.thumb = Some(format!("thumbs/{}", name));
+                    let markers =
+                        scale_markers(markers_for_action(&action, step_index), &hier, &png);
+                    // 标注关闭时直接写原始 PNG，不再整份拷贝一次
+                    let data: Option<Cow<'_, [u8]>> = if opts.annotate {
+                        match annotate_png(&png, &markers) {
+                            Ok(out) => Some(Cow::Owned(out)),
+                            Err(e) => {
+                                if opts.verbose {
+                                    eprintln!("[警告] 截图标注失败: {}", e);
                                 }
+                                None
                             }
                         }
-                        Err(e) => {
-                            if opts.verbose {
-                                eprintln!("[警告] 截图标注失败: {}", e);
+                    } else {
+                        Some(Cow::Borrowed(png.as_slice()))
+                    };
+                    if let Some(data) = data {
+                        let name = format!("step_{:04}_{}.png", step_index, action.kind());
+                        let p = shot_dir.join(&name);
+                        if std::fs::write(&p, &data).is_ok() {
+                            rec.screenshot = Some(format!("screenshots/{}", name));
+                            let tp = thumb_dir.join(&name);
+                            if write_thumbnail(&data, &tp, 260, 460).is_ok() {
+                                rec.thumb = Some(format!("thumbs/{}", name));
                             }
                         }
                     }
@@ -311,67 +336,15 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
             }
         }
 
-        steps.push(rec.clone());
         let _ = append_step(&steps_path, &rec);
+        steps.push(rec);
         prev_step = Some(steps.len() - 1);
 
         // ---- 异常
         for mut inc in monitor.poll() {
             incident_seq += 1;
             inc.step = Some(step_index);
-            let fname = format!(
-                "incidents/{}_{:02}_{}.txt",
-                inc.kind.as_str(),
-                incident_seq,
-                now_file_str()
-            );
-            let mut body = String::new();
-            body.push_str(&format!("类型: {}\n", inc.kind.cn()));
-            body.push_str(&format!("时间: {}\n", inc.time));
-            body.push_str(&format!("包名: {}\n", inc.package));
-            body.push_str(&format!("步骤: #{}\n", step_index));
-            body.push_str(&format!("摘要: {}\n\n", inc.summary));
-            body.push_str("---- logcat ----\n");
-            body.push_str(&inc.detail);
-            body.push('\n');
-
-            // 附加取证（限制次数，避免拖慢遍历）
-            if incident_seq <= 3 {
-                match inc.kind {
-                    IncidentKind::Anr => {
-                        let t = collect_anr_traces(dev);
-                        if !t.trim().is_empty() {
-                            body.push_str("\n---- /data/anr/traces.txt ----\n");
-                            body.push_str(&t);
-                        }
-                        let d = collect_dropbox(dev, "data_app_anr");
-                        if !d.trim().is_empty() {
-                            body.push_str("\n---- dropbox data_app_anr ----\n");
-                            body.push_str(&d);
-                        }
-                    }
-                    IncidentKind::Crash => {
-                        let d = collect_dropbox(dev, "data_app_crash");
-                        if !d.trim().is_empty() {
-                            body.push_str("\n---- dropbox data_app_crash ----\n");
-                            body.push_str(&d);
-                        }
-                    }
-                    IncidentKind::NativeCrash => {
-                        let d = collect_dropbox(dev, "system_app_native_crash");
-                        if !d.trim().is_empty() {
-                            body.push_str("\n---- dropbox native ----\n");
-                            body.push_str(&d);
-                        }
-                        let t = collect_tombstones(dev);
-                        if !t.trim().is_empty() {
-                            body.push_str("\n---- tombstone ----\n");
-                            body.push_str(&t);
-                        }
-                    }
-                }
-            }
-            let _ = std::fs::write(dir.join(&fname), &body);
+            let fname = write_incident_report(dev, &dir, &inc, incident_seq);
             inc.file = Some(fname);
             println!(
                 "[异常] {} · 步骤 #{} · {} → incidents/",
@@ -383,29 +356,30 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
 
             // 崩溃后应用通常已退出，稍后重启
             std::thread::sleep(Duration::from_millis(1200));
-            if !device::is_running(dev, &pkg) {
-                if relaunches < opts.max_relaunch {
-                    relaunches += 1;
-                    println!("[重启] 应用进程已退出，第 {} 次重启", relaunches);
-                    let _ = device::launch(dev, &pkg, opts.activity.as_deref());
-                    std::thread::sleep(Duration::from_millis(2000));
-                }
+            if !device::is_running(dev, &pkg) && relaunches < opts.max_relaunch {
+                relaunches += 1;
+                println!("[重启] 应用进程已退出，第 {} 次重启", relaunches);
+                let _ = device::launch(dev, &pkg, opts.activity.as_deref());
+                std::thread::sleep(Duration::from_millis(2000));
             }
         }
 
         // ---- 进度
-        if opts.verbose || step_index % 10 == 0 {
+        if opts.verbose || step_index.is_multiple_of(10) {
             let cov = ex.coverage();
             println!(
                 "[#{}] {} | {} | 状态 {} · Activity {} · 控件 {}/{} ({:.1}%) | 异常 {}",
                 step_index,
                 action.kind_cn(),
-                crate::util::truncate(&rec.action_label, 46),
+                crate::util::truncate(
+                    steps.last().map(|r| r.action_label.as_str()).unwrap_or(""),
+                    46
+                ),
                 ex.state_count(),
                 cov.activity_count,
-                cov.touched_nodes,
-                cov.total_nodes,
-                cov.node_coverage * 100.0,
+                cov.interactive_touched,
+                cov.interactive_nodes,
+                cov.interactive_coverage * 100.0,
                 incidents.len()
             );
         }
@@ -418,22 +392,7 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
     for mut inc in monitor.poll() {
         incident_seq += 1;
         inc.step = Some(step_index);
-        let fname = format!("incidents/{}_{:02}_{}.txt", inc.kind.as_str(), incident_seq, now_file_str());
-        let mut body = format!(
-            "类型: {}\n时间: {}\n包名: {}\n\n---- logcat ----\n{}\n",
-            inc.kind.cn(),
-            inc.time,
-            inc.package,
-            inc.detail
-        );
-        if inc.kind == IncidentKind::Anr {
-            let t = collect_anr_traces(dev);
-            if !t.trim().is_empty() {
-                body.push_str("\n---- traces ----\n");
-                body.push_str(&t);
-            }
-        }
-        let _ = std::fs::write(dir.join(&fname), &body);
+        let fname = write_incident_report(dev, &dir, &inc, incident_seq);
         inc.file = Some(fname);
         incidents.push(inc);
     }
@@ -452,12 +411,13 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
             seed: opts.seed,
             screenshot: opts.screenshot,
             annotate: opts.annotate,
+            state_mode: opts.state_mode.as_str().to_string(),
         },
         started_at,
         finished_at: now_str(),
         duration_ms: start.elapsed().as_millis() as u64,
-        steps: steps.clone(),
-        incidents: incidents.clone(),
+        steps,
+        incidents,
         coverage,
         transitions: ex.take_transitions(),
         state_count: ex.state_count(),
@@ -469,14 +429,77 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
     Ok(RunOutput { session, report })
 }
 
+/// 异常落盘：incidents/*.txt（logcat 块 + 有限次数的 dropbox / traces / tombstone 取证）
+fn write_incident_report(dev: &dyn Device, dir: &Path, inc: &Incident, seq: usize) -> String {
+    let fname = format!(
+        "incidents/{}_{:02}_{}.txt",
+        inc.kind.as_str(),
+        seq,
+        now_file_str()
+    );
+    let mut body = String::new();
+    body.push_str(&format!("类型: {}\n", inc.kind.cn()));
+    body.push_str(&format!("时间: {}\n", inc.time));
+    body.push_str(&format!("包名: {}\n", inc.package));
+    if let Some(st) = inc.step {
+        body.push_str(&format!("步骤: #{}\n", st));
+    }
+    body.push_str(&format!("摘要: {}\n\n", inc.summary));
+    body.push_str("---- logcat ----\n");
+    body.push_str(&inc.detail);
+    body.push('\n');
+
+    // 附加取证（限制次数，避免拖慢遍历）
+    if seq <= 3 {
+        match inc.kind {
+            IncidentKind::Anr => {
+                let t = collect_anr_traces(dev);
+                if !t.trim().is_empty() {
+                    body.push_str("\n---- /data/anr/traces.txt ----\n");
+                    body.push_str(&t);
+                }
+                let d = collect_dropbox(dev, "data_app_anr");
+                if !d.trim().is_empty() {
+                    body.push_str("\n---- dropbox data_app_anr ----\n");
+                    body.push_str(&d);
+                }
+            }
+            IncidentKind::Crash => {
+                let d = collect_dropbox(dev, "data_app_crash");
+                if !d.trim().is_empty() {
+                    body.push_str("\n---- dropbox data_app_crash ----\n");
+                    body.push_str(&d);
+                }
+            }
+            IncidentKind::NativeCrash => {
+                let d = collect_dropbox(dev, "system_app_native_crash");
+                if !d.trim().is_empty() {
+                    body.push_str("\n---- dropbox native ----\n");
+                    body.push_str(&d);
+                }
+                let t = collect_tombstones(dev);
+                if !t.trim().is_empty() {
+                    body.push_str("\n---- tombstone ----\n");
+                    body.push_str(&t);
+                }
+            }
+        }
+    }
+    let _ = std::fs::write(dir.join(&fname), &body);
+    fname
+}
+
 /// 执行一个动作
 pub fn execute_action(dev: &dyn Device, action: &Action) -> Result<()> {
     match action {
         Action::Click { point, .. } => device::input_tap(dev, point.0, point.1),
         Action::LongClick { point, .. } => device::input_long_press(dev, point.0, point.1, 900),
-        Action::Swipe { from, to, duration_ms, .. } => {
-            device::input_swipe(dev, from.0, from.1, to.0, to.1, *duration_ms)
-        }
+        Action::Swipe {
+            from,
+            to,
+            duration_ms,
+            ..
+        } => device::input_swipe(dev, from.0, from.1, to.0, to.1, *duration_ms),
         Action::Input { point, text, .. } => {
             device::input_tap(dev, point.0, point.1)?;
             std::thread::sleep(Duration::from_millis(250));
@@ -485,7 +508,9 @@ pub fn execute_action(dev: &dyn Device, action: &Action) -> Result<()> {
         Action::Back => device::press_back(dev),
         Action::Key { code, .. } => device::input_keyevent(dev, *code),
         Action::Launch { component } => {
-            let (p, a) = component.split_once('/').unwrap_or((component.as_str(), ""));
+            let (p, a) = component
+                .split_once('/')
+                .unwrap_or((component.as_str(), ""));
             device::launch(dev, p, Some(a)).map(|_| ())
         }
     }
@@ -523,14 +548,6 @@ fn scale_markers(mut markers: Vec<Marker>, hier: &Hierarchy, png: &[u8]) -> Vec<
     markers
 }
 
-fn finalize_png(png: &[u8], markers: &[Marker], annotate: bool) -> Result<Vec<u8>> {
-    if annotate {
-        annotate_png(png, markers)
-    } else {
-        Ok(png.to_vec())
-    }
-}
-
 /// 尝试关闭运行时权限弹窗 / 崩溃对话框，返回是否处理
 fn try_dismiss_dialog(dev: &dyn Device, h: &Hierarchy) -> Result<bool> {
     let allow_keys = [
@@ -540,7 +557,16 @@ fn try_dismiss_dialog(dev: &dyn Device, h: &Hierarchy) -> Result<bool> {
         "com.android.packageinstaller:id/ok_button",
         "android:id/button1",
     ];
-    let allow_texts = ["允许", "始终允许", "仅在使用该应用时允许", "确定", "ALLOW", "Allow", "OK", "关闭应用"];
+    let allow_texts = [
+        "允许",
+        "始终允许",
+        "仅在使用该应用时允许",
+        "确定",
+        "ALLOW",
+        "Allow",
+        "OK",
+        "关闭应用",
+    ];
 
     for n in h.visible_nodes() {
         let is_allow_id = allow_keys.iter().any(|k| n.resource_id.contains(k));
@@ -602,6 +628,7 @@ mod tests {
             keep_raw: false,
             text_pool: vec![],
             max_same_state: 6,
+            state_mode: StateMode::Structural,
             max_relaunch: 3,
             verbose: false,
             stop: Arc::new(AtomicBool::new(false)),
@@ -631,7 +658,11 @@ mod tests {
         assert!(kinds.contains("swipe"), "未产生滑动: {:?}", kinds);
 
         // 截图文件存在，且与原始截图不同（说明标注画上去了）
-        let first_shot = s.steps.iter().find_map(|x| x.screenshot.clone()).expect("没有截图记录");
+        let first_shot = s
+            .steps
+            .iter()
+            .find_map(|x| x.screenshot.clone())
+            .expect("没有截图记录");
         let p = dir.join(&first_shot);
         assert!(p.exists(), "截图缺失: {}", p.display());
         let annotated = std::fs::read(&p).unwrap();
@@ -670,7 +701,10 @@ mod tests {
         assert!(inc.summary.contains("FATAL EXCEPTION"), "{:?}", inc.summary);
         assert!(inc.detail.contains("com.demo"), "异常块中应包含包名");
         assert!(inc.file.is_some(), "异常日志未落盘");
-        assert!(dir.join(inc.file.as_ref().unwrap()).exists(), "异常文件不存在");
+        assert!(
+            dir.join(inc.file.as_ref().unwrap()).exists(),
+            "异常文件不存在"
+        );
 
         // 报告里应出现崩溃面板
         let html = std::fs::read_to_string(dir.join("report/index.html")).unwrap();

@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -82,7 +82,9 @@ fn classify(line: &str) -> Option<(IncidentKind, bool)> {
     if line.contains("FATAL EXCEPTION") || line.contains("am_crash") {
         return Some((IncidentKind::Crash, true));
     }
-    if line.contains("AndroidRuntime:") && (line.contains("Shutting down VM") || line.contains("FATAL")) {
+    if line.contains("AndroidRuntime:")
+        && (line.contains("Shutting down VM") || line.contains("FATAL"))
+    {
         return Some((IncidentKind::Crash, false));
     }
     None
@@ -204,6 +206,8 @@ fn run_loop<R: std::io::Read>(
     let mut total: u64 = 0;
     // 正在收集的异常块
     let mut pending: Option<Block> = None;
+    // 最近上报过的异常：(类型|包名) → 时间，用于跨日志通道去重
+    let mut recent: HashMap<String, Instant> = HashMap::new();
 
     loop {
         line.clear();
@@ -211,7 +215,7 @@ fn run_loop<R: std::io::Read>(
         if n == 0 {
             break; // EOF
         }
-        let line = line.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+        let line = line.trim_end_matches(['\n', '\r']).to_string();
 
         // 写原始日志
         if let Ok(mut g) = buf.lock() {
@@ -237,7 +241,7 @@ fn run_loop<R: std::io::Read>(
             };
             if start_new {
                 if let Some(b) = pending.take() {
-                    flush_block(b, total, &window, package, &tx);
+                    flush_block(b, total, &window, package, &tx, &mut recent);
                 }
                 pending = Some(Block {
                     kind,
@@ -257,7 +261,7 @@ fn run_loop<R: std::io::Read>(
             .unwrap_or(false);
         if due {
             if let Some(b) = pending.take() {
-                flush_block(b, total + 1, &window, package, &tx);
+                flush_block(b, total + 1, &window, package, &tx, &mut recent);
             }
         }
 
@@ -268,9 +272,45 @@ fn run_loop<R: std::io::Read>(
 
     // EOF：把还没收集完的异常块冲刷出去（例如 logcat 进程结束）
     if let Some(b) = pending.take() {
-        flush_block(b, total + 1, &window, package, &tx);
+        flush_block(b, total + 1, &window, package, &tx, &mut recent);
     }
     Ok(())
+}
+
+/// 同一次异常常被多条日志通道重复上报 —— 一次 Java 崩溃会同时产生
+/// AndroidRuntime 的 `FATAL EXCEPTION` 和 ActivityManager 的 `am_crash`，
+/// 一次 ANR 也会同时有 `ANR in` 和 `am_anr`。这个窗口内、同类型同包名的异常
+/// 视为同一事件，只记一条，否则报告里的 crash/anr 计数会凭空翻倍。
+const DEDUP_WINDOW: Duration = Duration::from_secs(5);
+
+/// 从异常详情里抽出「特征」，用来判断两条上报是不是同一个事件。
+///
+/// 同一次崩溃会在两条日志通道里出现，内容形态完全不同（一边是 Java 堆栈、
+/// 一边是 events buffer 的 `am_crash` 单行），但它们**都含同一个异常类名**，
+/// 所以拿类名当指纹比单纯用时间窗口更准：
+/// 既能合并同一事件的重复上报，又不会把 5 秒内连续发生的两个不同崩溃吞掉。
+fn incident_fingerprint(detail: &str) -> Option<String> {
+    for line in detail.lines() {
+        // Native 崩溃：FATAL SIGNAL 11 → signal-11
+        if let Some(i) = line.find("FATAL SIGNAL") {
+            let sig: String = line[i + "FATAL SIGNAL".len()..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !sig.is_empty() {
+                return Some(format!("signal-{sig}"));
+            }
+        }
+        // Java 崩溃：java.lang.NullPointerException / OutOfMemoryError …
+        for tok in line.split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '_' || c == '$'))
+        {
+            if tok.len() > 8 && (tok.ends_with("Exception") || tok.ends_with("Error")) {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// 正在收集中的异常块
@@ -289,6 +329,7 @@ fn flush_block(
     window: &VecDeque<(u64, String)>,
     package: &str,
     tx: &Sender<Incident>,
+    recent: &mut HashMap<String, Instant>,
 ) {
     let detail: Vec<String> = window
         .iter()
@@ -300,6 +341,17 @@ fn flush_block(
         return;
     }
     if package.is_empty() || detail.contains(package) || b.summary.contains(package) {
+        // 同类型 + 同包名 + 同异常特征，且在去重窗口内 → 判定为同一事件走了另一条日志通道
+        let fp = incident_fingerprint(&detail).unwrap_or_else(|| "unknown".to_string());
+        let key = format!("{:?}|{}|{}", b.kind, package, fp);
+        let now = Instant::now();
+        if recent
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < DEDUP_WINDOW)
+        {
+            return;
+        }
+        recent.insert(key, now);
         let _ = tx.send(Incident {
             kind: b.kind,
             time: now_str(),
@@ -410,7 +462,10 @@ mod tests {
             classify("09-09 23:50:01.123  1234  1234 F libc    : FATAL SIGNAL 11"),
             Some((IncidentKind::NativeCrash, true))
         );
-        assert_eq!(classify("09-09 23:50:01.123  1234  1234 D okhttp: --> GET http"), None);
+        assert_eq!(
+            classify("09-09 23:50:01.123  1234  1234 D okhttp: --> GET http"),
+            None
+        );
     }
 
     #[test]
@@ -437,9 +492,17 @@ mod tests {
                    09-09 23:50:03.000   100   100 D other: after\n";
 
         let got = collect(log, "com.demo");
-        assert_eq!(got.len(), 1, "应收集到 1 条崩溃: {:?}", got.iter().map(|x| x.kind).collect::<Vec<_>>());
+        assert_eq!(
+            got.len(),
+            1,
+            "应收集到 1 条崩溃: {:?}",
+            got.iter().map(|x| x.kind).collect::<Vec<_>>()
+        );
         assert_eq!(got[0].kind, IncidentKind::Crash);
-        assert!(got[0].detail.contains("NullPointerException"), "堆栈未收集全");
+        assert!(
+            got[0].detail.contains("NullPointerException"),
+            "堆栈未收集全"
+        );
         assert!(got[0].detail.contains("Process: com.demo"));
 
         // 包名不匹配 → 丢弃
@@ -458,9 +521,77 @@ mod tests {
 
         let got = collect(log, "com.demo");
         let kinds: Vec<IncidentKind> = got.iter().map(|x| x.kind).collect();
-        assert_eq!(kinds, vec![IncidentKind::Crash, IncidentKind::Anr], "异常被错误合并: {:?}", kinds);
+        assert_eq!(
+            kinds,
+            vec![IncidentKind::Crash, IncidentKind::Anr],
+            "异常被错误合并: {:?}",
+            kinds
+        );
         assert!(got[0].detail.contains("Main.onClick"), "崩溃堆栈不完整");
         assert!(!got[0].detail.contains("ANR in"), "ANR 内容混进了崩溃块");
-        assert!(got[1].detail.contains("Input dispatching timed out"), "ANR 详情不完整");
+        assert!(
+            got[1].detail.contains("Input dispatching timed out"),
+            "ANR 详情不完整"
+        );
+    }
+
+    /// 同一次崩溃会同时出现在两条日志通道：AndroidRuntime 的 FATAL EXCEPTION
+    /// 和 ActivityManager 的 am_crash。去重后只应记一条，否则 crash 计数凭空翻倍。
+    #[test]
+    fn deduplicates_crash_across_log_channels() {
+        let log = "09-09 23:50:01.100  1234  1234 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                   09-09 23:50:01.101  1234  1234 E AndroidRuntime: Process: com.demo, PID: 1234\n\
+                   09-09 23:50:01.102  1234  1234 E AndroidRuntime: \tat com.demo.Main.onClick(Main.java:42)\n\
+                   09-09 23:50:01.102  1234  1234 E AndroidRuntime: Caused by: java.lang.NullPointerException\n\
+                   09-09 23:50:01.180  1234  1234 I am_crash: [1234,0,com.demo,0,java.lang.NullPointerException,Unknown]\n";
+
+        let got = collect(log, "com.demo");
+        assert_eq!(
+            got.len(),
+            1,
+            "同一次崩溃被记了两次: {:?}",
+            got.iter().map(|i| i.summary.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            got[0].detail.contains("Main.onClick"),
+            "应保留信息更全的那条（堆栈）"
+        );
+    }
+
+    /// 反向约束：5 秒内发生的两个「不同」崩溃不能被误合并
+    #[test]
+    fn keeps_distinct_crashes_within_dedup_window() {
+        let log = "09-09 23:50:01.100  1234  1234 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                   09-09 23:50:01.101  1234  1234 E AndroidRuntime: Process: com.demo, PID: 1234\n\
+                   09-09 23:50:01.102  1234  1234 E AndroidRuntime: java.lang.NullPointerException\n\
+                   09-09 23:50:02.900  1234  1234 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                   09-09 23:50:02.901  1234  1234 E AndroidRuntime: Process: com.demo, PID: 1234\n\
+                   09-09 23:50:02.902  1234  1234 E AndroidRuntime: java.lang.IllegalStateException\n";
+
+        let got = collect(log, "com.demo");
+        assert_eq!(
+            got.len(),
+            2,
+            "不同异常不应被合并: {:?}",
+            got.iter().map(|i| i.summary.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn extracts_incident_fingerprint() {
+        assert_eq!(
+            incident_fingerprint("E AndroidRuntime: java.lang.NullPointerException"),
+            Some("java.lang.NullPointerException".to_string())
+        );
+        assert_eq!(
+            incident_fingerprint("F libc    : FATAL SIGNAL 11 (SIGSEGV)"),
+            Some("signal-11".to_string())
+        );
+        assert_eq!(
+            incident_fingerprint(
+                "I am_anr  : [0,1234,com.demo,550026048,Input dispatching timed out]"
+            ),
+            None
+        );
     }
 }

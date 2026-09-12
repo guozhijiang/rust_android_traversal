@@ -32,7 +32,11 @@ use std::sync::Arc;
 const REMOTE_BIN: &str = "/data/local/tmp/atraverse";
 
 #[derive(Parser, Debug)]
-#[command(name = "atraverse", version, about = "Android 应用智能遍历工具（Fastbot 形态）")]
+#[command(
+    name = "atraverse",
+    version,
+    about = "Android 应用智能遍历工具（Fastbot 形态）"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -95,6 +99,9 @@ enum Cmd {
         /// 打开生成的报告
         #[arg(long)]
         open: bool,
+        /// 状态指纹取法（用于对照两种口径的效果）
+        #[arg(long, default_value = "structural", value_parser = ["structural", "exact"])]
+        state_mode: String,
     },
 
     /// 探测设备能力（dump / 截图 / activity）
@@ -158,6 +165,12 @@ struct AgentArgs {
     #[arg(long, default_value_t = 8)]
     max_same_state: usize,
 
+    /// 状态指纹取法：structural = 只看可交互控件身份（默认，界面上的时间/电量/
+    /// 进度百分比这类动态文本不会干扰判定）；exact = 把全部文本也算进指纹（旧行为，
+    /// 动态文本多时状态会爆炸，导致同一页面被反复探索）
+    #[arg(long, default_value = "structural", value_parser = ["structural", "exact"])]
+    state_mode: String,
+
     /// 应用最多被重启多少次
     #[arg(long, default_value_t = 30)]
     max_relaunch: usize,
@@ -203,11 +216,24 @@ fn main() -> Result<()> {
         Cmd::Agent(a) => cmd_agent(a),
         Cmd::Run(a) => cmd_run(a),
         Cmd::Build { abi, serial } => cmd_build(&abi, serial.as_deref()),
-        Cmd::Deploy { serial, binary, rebuild } => cmd_deploy(serial.as_deref(), binary.as_deref(), rebuild),
-        Cmd::Pull { remote, local, serial } => cmd_pull(&remote, local.as_deref(), serial.as_deref()),
+        Cmd::Deploy {
+            serial,
+            binary,
+            rebuild,
+        } => cmd_deploy(serial.as_deref(), binary.as_deref(), rebuild),
+        Cmd::Pull {
+            remote,
+            local,
+            serial,
+        } => cmd_pull(&remote, local.as_deref(), serial.as_deref()),
         Cmd::Report { session } => cmd_report(&session),
         Cmd::Devices => cmd_devices(),
-        Cmd::Demo { out, steps, open } => cmd_demo(out.as_deref(), steps, open),
+        Cmd::Demo {
+            out,
+            steps,
+            open,
+            state_mode,
+        } => cmd_demo(out.as_deref(), steps, open, &state_mode),
         Cmd::Probe { serial } => cmd_probe(serial),
     }
 }
@@ -224,30 +250,15 @@ fn cmd_agent(a: AgentArgs) -> Result<()> {
             util::ensure_dir(p)?;
             p.clone()
         }
-        None => PathBuf::from(runner::pick_device_output(&runner::default_session_name(&a.package))),
+        None => PathBuf::from(runner::pick_device_output(&runner::default_session_name(
+            &a.package,
+        ))),
     };
 
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(stop.clone());
 
-    let opts = runner::RunOptions {
-        package: a.package.clone(),
-        activity: a.activity.clone(),
-        output: output.clone(),
-        duration_secs: a.duration,
-        max_steps: a.max_steps,
-        interval_ms: a.interval,
-        settle_ms: a.settle,
-        seed: a.seed,
-        screenshot: !a.no_screenshot,
-        annotate: !a.no_annotate,
-        keep_raw: a.keep_raw,
-        text_pool: load_text_pool(a.text_pool.as_deref())?,
-        max_same_state: a.max_same_state,
-        max_relaunch: a.max_relaunch,
-        verbose: a.verbose,
-        stop,
-    };
+    let opts = build_opts(&a, output.clone(), stop)?;
 
     println!("[输出目录] {}", output.display());
     let out = runner::run(&mut dev, opts)?;
@@ -269,7 +280,10 @@ fn cmd_run(a: RunArgs) -> Result<()> {
         let mut dev = adb;
         let stop = Arc::new(AtomicBool::new(false));
         install_signal_handler(stop.clone());
-        let output = a.out.clone().unwrap_or_else(|| runner::default_output_dir(&a.agent.package));
+        let output = a
+            .out
+            .clone()
+            .unwrap_or_else(|| runner::default_output_dir(&a.agent.package));
         util::ensure_dir(&output)?;
         let opts = build_opts(&a.agent, output.clone(), stop)?;
         let out = runner::run(&mut dev, opts)?;
@@ -280,11 +294,9 @@ fn cmd_run(a: RunArgs) -> Result<()> {
     // ---- 设备端模式：编译 → push → 远端执行 → 拉取
     let target = resolve_target(&adb)?;
     let bin = target_binary(&target);
-    if !a.no_build {
-        if !bin.exists() || a.force_push {
-            println!("[编译] {}", target);
-            cargo_build(&target)?;
-        }
+    if !a.no_build && (!bin.exists() || a.force_push) {
+        println!("[编译] {}", target);
+        cargo_build(&target)?;
     }
     if !bin.exists() {
         bail!(
@@ -294,7 +306,10 @@ fn cmd_run(a: RunArgs) -> Result<()> {
     }
     println!("[部署] {} -> {}", bin.display(), REMOTE_BIN);
     adb.push(&bin, REMOTE_BIN)?;
-    adb.sh("chmod 755 /data/local/tmp/atraverse", std::time::Duration::from_secs(10))?;
+    adb.sh(
+        "chmod 755 /data/local/tmp/atraverse",
+        std::time::Duration::from_secs(10),
+    )?;
 
     let name = runner::default_session_name(&a.agent.package);
     let remote_out = format!("{}/{}", a.remote_dir.trim_end_matches('/'), name);
@@ -337,8 +352,11 @@ fn cmd_run(a: RunArgs) -> Result<()> {
 
     println!("[拉取] {} -> {}", remote_out, local_out.display());
     util::ensure_dir(&local_out)?;
-    adb.pull(&remote_out, &local_out.parent().unwrap_or(std::path::Path::new(".")))
-        .context("拉取结果失败（若 /sdcard 不可写，可改用 --remote-dir /data/local/tmp/atraverse）")?;
+    adb.pull(
+        &remote_out,
+        local_out.parent().unwrap_or(std::path::Path::new(".")),
+    )
+    .context("拉取结果失败（若 /sdcard 不可写，可改用 --remote-dir /data/local/tmp/atraverse）")?;
 
     let pulled = if local_out.join("session.json").exists() {
         local_out.clone()
@@ -373,6 +391,8 @@ fn build_opts(a: &AgentArgs, output: PathBuf, stop: Arc<AtomicBool>) -> Result<r
         keep_raw: a.keep_raw,
         text_pool: load_text_pool(a.text_pool.as_deref())?,
         max_same_state: a.max_same_state,
+        state_mode: crate::strategy::StateMode::parse(&a.state_mode)
+            .ok_or_else(|| anyhow::anyhow!("未知的 --state-mode 取值: {}", a.state_mode))?,
         max_relaunch: a.max_relaunch,
         verbose: a.verbose,
         stop,
@@ -412,10 +432,17 @@ fn cmd_deploy(serial: Option<&str>, binary: Option<&std::path::Path>, rebuild: b
         None => target_binary(&target),
     };
     if !bin.exists() {
-        bail!("未找到二进制: {}（先 cargo build --target {} --release）", bin.display(), target);
+        bail!(
+            "未找到二进制: {}（先 cargo build --target {} --release）",
+            bin.display(),
+            target
+        );
     }
     adb.push(&bin, REMOTE_BIN)?;
-    adb.sh("chmod 755 /data/local/tmp/atraverse", std::time::Duration::from_secs(10))?;
+    adb.sh(
+        "chmod 755 /data/local/tmp/atraverse",
+        std::time::Duration::from_secs(10),
+    )?;
     println!("[完成] {} 已部署到 {}", bin.display(), REMOTE_BIN);
     Ok(())
 }
@@ -432,7 +459,7 @@ fn cmd_pull(remote: &str, local: Option<&std::path::Path>, serial: Option<&str>)
     Ok(())
 }
 
-fn cmd_report(dir: &PathBuf) -> Result<()> {
+fn cmd_report(dir: &std::path::Path) -> Result<()> {
     let s = session::read_session(dir)?;
     let p = report::render(&s, &dir.join("report"))?;
     println!("报告已生成: {}", p.display());
@@ -455,7 +482,12 @@ fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
-fn cmd_demo(out: Option<&std::path::Path>, steps: usize, open: bool) -> Result<()> {
+fn cmd_demo(
+    out: Option<&std::path::Path>,
+    steps: usize,
+    open: bool,
+    state_mode: &str,
+) -> Result<()> {
     use device::mock::MockDevice;
 
     let dir = match out {
@@ -494,6 +526,8 @@ fn cmd_demo(out: Option<&std::path::Path>, steps: usize, open: bool) -> Result<(
         keep_raw: false,
         text_pool: vec![],
         max_same_state: 6,
+        state_mode: crate::strategy::StateMode::parse(state_mode)
+            .ok_or_else(|| anyhow::anyhow!("未知的 --state-mode 取值: {}", state_mode))?,
         max_relaunch: 3,
         verbose: false,
         stop,
@@ -512,7 +546,9 @@ fn opener(path: &std::path::Path) -> Result<()> {
     let p = path.to_string_lossy().to_string();
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("cmd").args(["/C", "start", "", &p]).spawn();
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &p])
+            .spawn();
     }
     #[cfg(not(windows))]
     {
@@ -527,7 +563,10 @@ fn cmd_probe(serial: Option<String>) -> Result<()> {
     let info = device::DeviceInfo::fetch(&dev, "")?;
     println!("设备: {}", info.display());
     println!("ABI -> target: {}", device::target_for_abi(&info.abi));
-    println!("当前 Activity: {}", device::current_activity(&dev).unwrap_or_else(|e| format!("<{}>", e)));
+    println!(
+        "当前 Activity: {}",
+        device::current_activity(&dev).unwrap_or_else(|e| format!("<{}>", e))
+    );
     match dev.dump_xml() {
         Ok(xml) => match dump::parse_hierarchy(&xml) {
             Ok(h) => {
@@ -541,7 +580,13 @@ fn cmd_probe(serial: Option<String>) -> Result<()> {
                     vis.iter().filter(|n| n.interactive()).count()
                 );
                 for n in vis.iter().take(12) {
-                    println!("  {} {} {} {}", n.short_class(), n.resource_id, util::truncate(&n.text, 16), n.bounds);
+                    println!(
+                        "  {} {} {} {}",
+                        n.short_class(),
+                        n.resource_id,
+                        util::truncate(&n.text, 16),
+                        n.bounds
+                    );
                 }
             }
             Err(e) => println!("解析失败: {}", e),
@@ -587,8 +632,15 @@ fn resolve_target(adb: &device::AdbDevice) -> Result<String> {
 }
 
 fn target_binary(target: &str) -> PathBuf {
-    let name = if cfg!(windows) { "atraverse.exe" } else { "atraverse" };
-    PathBuf::from("target").join(target).join("release").join(name)
+    let name = if cfg!(windows) {
+        "atraverse.exe"
+    } else {
+        "atraverse"
+    };
+    PathBuf::from("target")
+        .join(target)
+        .join("release")
+        .join(name)
 }
 
 fn cargo_build(target: &str) -> Result<()> {
@@ -605,16 +657,37 @@ fn cargo_build(target: &str) -> Result<()> {
 fn print_summary(s: &session::Session, dir: &std::path::Path, report: &std::path::Path) {
     println!("\n================ 遍历完成 ================");
     println!("应用        : {}", s.package);
-    println!("运行位置    : {}", if s.device.mode == "device" { "手机端" } else { "PC 端（adb）" });
-    println!("步骤        : {} 步（{}）", s.steps.len(), util::fmt_duration(s.duration_ms));
-    println!("Activity    : {} 个，去重状态 {} 个", s.coverage.activity_count, s.state_count);
     println!(
-        "控件覆盖    : {}/{} ({:.1}%)",
+        "运行位置    : {}",
+        if s.device.mode == "device" {
+            "手机端"
+        } else {
+            "PC 端（adb）"
+        }
+    );
+    println!(
+        "步骤        : {} 步（{}）",
+        s.steps.len(),
+        util::fmt_duration(s.duration_ms)
+    );
+    println!(
+        "Activity    : {} 个，去重状态 {} 个",
+        s.coverage.activity_count, s.state_count
+    );
+    println!(
+        "控件覆盖    : {}/{} ({:.1}%)  [可交互控件；全部节点 {}/{} = {:.1}%]",
+        s.coverage.interactive_touched,
+        s.coverage.interactive_nodes,
+        s.coverage.interactive_coverage * 100.0,
         s.coverage.touched_nodes,
         s.coverage.total_nodes,
         s.coverage.node_coverage * 100.0
     );
-    println!("异常        : crash {} 个，ANR {} 个", s.crash_count(), s.anr_count());
+    println!(
+        "异常        : crash {} 个，ANR {} 个",
+        s.crash_count(),
+        s.anr_count()
+    );
     println!("会话目录    : {}", dir.display());
     println!("报告        : {}", report.display());
     println!("==========================================");

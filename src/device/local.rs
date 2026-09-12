@@ -3,7 +3,7 @@
 //! 直接 exec `/system/bin` 下的工具：uiautomator / input / screencap / logcat / dumpsys，
 //! 不需要 adb 转发，因此不受 USB 传输与 adb 协议开销影响（Fastbot 的同款形态）。
 
-use super::{capture_output, Device, DUMP_TIMEOUT, DEFAULT_TIMEOUT};
+use super::{capture_output, Device, DEFAULT_TIMEOUT, DUMP_TIMEOUT};
 use anyhow::{bail, Context, Result};
 use std::process::{Command, Stdio};
 
@@ -12,7 +12,6 @@ const PATH_ENV: &str = "/apex/com.android.runtime/bin:/apex/com.android.art/bin:
 
 pub struct LocalDevice {
     dump_path: String,
-    seq: u32,
 }
 
 impl Default for LocalDevice {
@@ -26,7 +25,6 @@ impl LocalDevice {
         let pid = std::process::id();
         Self {
             dump_path: format!("/data/local/tmp/.atraverse_dump_{}.xml", pid),
-            seq: 0,
         }
     }
 
@@ -67,24 +65,33 @@ impl Device for LocalDevice {
     }
 
     fn dump_xml(&mut self) -> Result<String> {
-        // 手机上没有可用的 /dev/tty，落文件再读回
-        self.seq = self.seq.wrapping_add(1);
-        let path = if self.seq == 1 {
-            self.dump_path.clone()
+        // 复用同一路径并在读取后删除：dump 前先清掉旧文件保证不会读到残留，
+        // 也不会像递增文件名那样在 /data/local/tmp 里堆积上千个 XML 小文件
+        let path = &self.dump_path;
+        let _ = std::fs::remove_file(path);
+        self.sh(
+            &format!("uiautomator dump {} >/dev/null 2>&1", path),
+            DUMP_TIMEOUT,
+        )?;
+        let s = std::fs::read_to_string(path)
+            .with_context(|| format!("读取 dump 文件失败: {}", path))?;
+        let _ = std::fs::remove_file(path);
+        if s.contains("<hierarchy") {
+            Ok(s)
         } else {
-            format!("{}.{}", self.dump_path, self.seq)
-        };
-        self.sh(&format!("uiautomator dump {} >/dev/null 2>&1", path), DUMP_TIMEOUT)?;
-        match std::fs::read_to_string(&path) {
-            Ok(s) if s.contains("<hierarchy") => Ok(s),
-            Ok(_) => bail!("uiautomator dump 内容异常: {}", crate::util::truncate(&self.dump_path, 80)),
-            Err(e) => Err(e).with_context(|| format!("读取 dump 文件失败: {}", path)),
+            bail!(
+                "uiautomator dump 内容异常: {}",
+                crate::util::truncate(&s, 80)
+            )
         }
     }
 
     fn logcat_cmd(&self) -> Command {
         let mut c = Self::base_cmd("logcat");
-        c.arg("-v").arg("time").stdout(Stdio::piped()).stderr(Stdio::null());
+        c.arg("-v")
+            .arg("time")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         c
     }
 

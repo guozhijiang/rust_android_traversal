@@ -97,7 +97,10 @@ impl Device for MockDevice {
             ["wm", "size"] => Ok("Physical size: 540x1200".to_string()),
             ["dumpsys", "activity", ..] => {
                 let a = self.activity();
-                Ok(format!("topResumedActivity=ActivityRecord{{1 u0 {} t1}}", a))
+                Ok(format!(
+                    "topResumedActivity=ActivityRecord{{1 u0 {} t1}}",
+                    a
+                ))
             }
             ["input", "tap", x, y] => {
                 let y: i32 = y.parse().unwrap_or(0);

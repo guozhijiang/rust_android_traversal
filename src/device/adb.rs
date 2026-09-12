@@ -1,6 +1,6 @@
 //! PC 端后端：通过 adb 转发命令（调试用，或没有交叉编译产物时使用）。
 
-use super::{capture_output, Device, DUMP_TIMEOUT, DEFAULT_TIMEOUT};
+use super::{capture_output, Device, DEFAULT_TIMEOUT, DUMP_TIMEOUT};
 use anyhow::{bail, Context, Result};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -121,7 +121,6 @@ impl AdbDevice {
             .context("执行 adb shell 失败")?;
         Ok(status)
     }
-
 }
 
 impl Device for AdbDevice {
@@ -163,7 +162,11 @@ impl Device for AdbDevice {
                             self.dump_mode = Some(DumpMode::File);
                             Ok(xml)
                         }
-                        Err(e2) => bail!("uiautomator dump 失败：/dev/tty -> {}；文件方式 -> {}", e, e2),
+                        Err(e2) => bail!(
+                            "uiautomator dump 失败：/dev/tty -> {}；文件方式 -> {}",
+                            e,
+                            e2
+                        ),
                     },
                 }
             }

@@ -1,16 +1,17 @@
 //! 高覆盖遍历策略：动作候选生成 + 未探索优先的加权选择 + 状态图 + 覆盖率统计。
 //!
 //! 思路参考 Fastbot：
-//!  1. 以「Activity + 可见控件内容签名」做状态指纹，去重并记录访问次数；
+//!  1. 以「Activity + 可交互控件身份集合」做状态指纹（结构优先，不受动态文本干扰），
+//!     去重并记录访问次数；
 //!  2. 每个状态维护「已尝试动作集合」，优先挑选从未尝试过的动作；
 //!  3. 全局维护「控件是否被操作过」，未操作过的控件权重放大，驱动覆盖率提升；
 //!  4. 状态无未尝试动作时按权重随机（探索 vs 利用），连续卡在同一状态则触发回溯（返回键）。
 
 use crate::model::{Action, Hierarchy, Rect, SwipeDir, TargetInfo};
 use crate::util::hash64;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -22,6 +23,8 @@ pub struct ExplorerConfig {
     pub enable_long_click: bool,
     pub enable_input: bool,
     pub enable_horizontal_swipe: bool,
+    /// 状态指纹取法，默认结构优先
+    pub state_mode: StateMode,
 }
 
 impl Default for ExplorerConfig {
@@ -33,6 +36,35 @@ impl Default for ExplorerConfig {
             enable_long_click: true,
             enable_input: true,
             enable_horizontal_swipe: true,
+            state_mode: StateMode::default(),
+        }
+    }
+}
+
+/// 状态指纹的取法
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StateMode {
+    /// 结构优先（默认）：只看可交互控件的身份集合，动态文本不影响判定
+    #[default]
+    Structural,
+    /// 内容精确：界面全部文本都算进指纹。动态文本多时状态会爆炸，仅用于对照排查
+    Exact,
+}
+
+impl StateMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StateMode::Structural => "structural",
+            StateMode::Exact => "exact",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "structural" | "struct" | "s" => Some(StateMode::Structural),
+            "exact" | "content" | "e" => Some(StateMode::Exact),
+            _ => None,
         }
     }
 }
@@ -79,6 +111,10 @@ pub struct NodeStat {
     pub activity: String,
     pub seen: u32,
     pub touched: u32,
+    /// 是否是「可交互目标」（见 `UiNode::coverage_target`）。
+    /// 同一 key 只要出现过一次可交互形态就算可交互。
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,11 +158,18 @@ impl Explorer {
 
     /// 记录一次观测，返回 (state_id, 是否新状态)
     pub fn observe(&mut self, h: &Hierarchy, activity: &str, step: usize) -> (u64, bool) {
-        let id = hash64(&h.state_sig(activity));
+        // 全树遍历只做这一次：状态指纹、控件登记、Activity 登记共用同一份可见节点
+        let visible = h.visible_nodes();
+        let screen = h.screen();
+        let sig = match self.cfg.state_mode {
+            StateMode::Structural => Hierarchy::struct_sig_with(activity, &screen, &visible),
+            StateMode::Exact => Hierarchy::state_sig_with(activity, &screen, &visible),
+        };
+        let id = hash64(&sig);
         let is_new = !self.states.contains_key(&id);
 
         // 覆盖率：登记所有可见控件
-        for n in h.visible_nodes() {
+        for n in &visible {
             if !self.cfg.package.is_empty()
                 && !n.package.is_empty()
                 && n.package != self.cfg.package
@@ -134,6 +177,7 @@ impl Explorer {
                 continue; // 系统/其它应用的控件不计入被测应用覆盖率
             }
             let key = n.key();
+            let is_target = n.coverage_target();
             let record = self.nodes.entry(key.clone()).or_insert_with(|| NodeStat {
                 key: key.clone(),
                 label: n.display(),
@@ -142,25 +186,23 @@ impl Explorer {
                 activity: activity.to_string(),
                 seen: 0,
                 touched: 0,
+                interactive: is_target,
             });
             record.seen += 1;
+            record.interactive |= is_target;
             if record.activity.is_empty() {
                 record.activity = activity.to_string();
             }
         }
 
-        let interactive_count = h
-            .visible_nodes()
-            .iter()
-            .filter(|n| n.interactive())
-            .count();
+        let interactive_count = visible.iter().filter(|n| n.interactive()).count();
 
         let st = self.states.entry(id).or_insert_with(|| StateRecord {
             id,
             activity: activity.to_string(),
             visits: 0,
             first_step: step,
-            node_count: h.nodes().len(),
+            node_count: h.node_count(),
             interactive_count,
             tried_count: 0,
         });
@@ -183,7 +225,7 @@ impl Explorer {
             && !activity.is_empty()
             && activity.starts_with(&self.cfg.package)
         {
-            for n in h.visible_nodes() {
+            for n in &visible {
                 if !n.package.is_empty() && n.package != self.cfg.package {
                     continue;
                 }
@@ -216,7 +258,7 @@ impl Explorer {
 
     // -------------------------------------------------- 动作生成
 
-    fn candidates(&self, h: &Hierarchy) -> Vec<Candidate> {
+    fn candidates(&mut self, h: &Hierarchy) -> Vec<Candidate> {
         let screen = h.screen();
         let screen_area = screen.area().max(1) as f32;
         let mut out: Vec<Candidate> = Vec::new();
@@ -243,11 +285,7 @@ impl Explorer {
             let mut base = if foreign { 0.4f32 } else { 1.0f32 };
 
             // 全局未被操作过的控件放大权重——这是提升覆盖率的主要驱动力
-            let touched = self
-                .nodes
-                .get(&n.key())
-                .map(|s| s.touched)
-                .unwrap_or(0);
+            let touched = self.nodes.get(&n.key()).map(|s| s.touched).unwrap_or(0);
             if touched == 0 {
                 base *= 3.0;
             } else if touched <= 2 {
@@ -260,20 +298,29 @@ impl Explorer {
 
             if n.clickable || n.checkable || n.is_edit_text() {
                 out.push(Candidate {
-                    action: Action::Click { target: target.clone(), point },
+                    action: Action::Click {
+                        target: target.clone(),
+                        point,
+                    },
                     weight: 10.0 * base,
                 });
             } else if n.is_leaf_with_content() {
                 // 文本叶子节点：自身不可点击，但点击通常会冒泡到父容器
                 out.push(Candidate {
-                    action: Action::Click { target: target.clone(), point },
+                    action: Action::Click {
+                        target: target.clone(),
+                        point,
+                    },
                     weight: 4.0 * base,
                 });
             }
 
             if self.cfg.enable_long_click && n.long_clickable {
                 out.push(Candidate {
-                    action: Action::LongClick { target: target.clone(), point },
+                    action: Action::LongClick {
+                        target: target.clone(),
+                        point,
+                    },
                     weight: 3.0 * base,
                 });
             }
@@ -282,11 +329,15 @@ impl Explorer {
                 let text = self
                     .cfg
                     .text_pool
-                    .choose(&mut self.rng.clone())
+                    .choose(&mut self.rng)
                     .cloned()
                     .unwrap_or_else(|| "test".to_string());
                 out.push(Candidate {
-                    action: Action::Input { target: target.clone(), point, text },
+                    action: Action::Input {
+                        target: target.clone(),
+                        point,
+                        text,
+                    },
                     weight: 5.0 * base,
                 });
             }
@@ -322,7 +373,13 @@ impl Explorer {
         if out.is_empty() {
             let (from, to) = swipe_points(&screen.shrink(0.2, 0.2), SwipeDir::Up);
             out.push(Candidate {
-                action: Action::Swipe { target: None, from, to, dir: SwipeDir::Up, duration_ms: 320 },
+                action: Action::Swipe {
+                    target: None,
+                    from,
+                    to,
+                    dir: SwipeDir::Up,
+                    duration_ms: 320,
+                },
                 weight: 1.0,
             });
         }
@@ -335,10 +392,10 @@ impl Explorer {
         if cands.is_empty() {
             return None;
         }
-        let tried: HashSet<String> = self.tried.get(&state_id).cloned().unwrap_or_default();
+        let tried_set = self.tried.get(&state_id);
         let fresh: Vec<&Candidate> = cands
             .iter()
-            .filter(|c| !tried.contains(&c.action.action_key()))
+            .filter(|c| !tried_set.is_some_and(|t| t.contains(&c.action.action_key())))
             .collect();
 
         let chosen = if !fresh.is_empty() {
@@ -392,35 +449,47 @@ impl Explorer {
             .values()
             .filter(|a| self.cfg.package.is_empty() || a.name.starts_with(&self.cfg.package))
             .map(|a| {
-                let total = a.nodes.len();
-                let touched = a
-                    .nodes
-                    .iter()
-                    .filter(|k| self.nodes.get(*k).map(|s| s.touched > 0).unwrap_or(false))
-                    .count();
+                let mut total = 0usize;
+                let mut touched = 0usize;
+                let mut i_total = 0usize;
+                let mut i_touched = 0usize;
+                for k in &a.nodes {
+                    let stat = self.nodes.get(k);
+                    let was_touched = stat.map(|s| s.touched > 0).unwrap_or(false);
+                    total += 1;
+                    if was_touched {
+                        touched += 1;
+                    }
+                    if stat.map(|s| s.interactive).unwrap_or(false) {
+                        i_total += 1;
+                        if was_touched {
+                            i_touched += 1;
+                        }
+                    }
+                }
                 ActivityCoverage {
                     name: a.name.clone(),
                     visits: a.visits,
                     first_step: a.first_step,
                     nodes_seen: total,
                     nodes_touched: touched,
-                    coverage: if total == 0 {
-                        0.0
-                    } else {
-                        touched as f32 / total as f32
-                    },
+                    coverage: ratio(touched, total),
+                    interactive_seen: i_total,
+                    interactive_touched: i_touched,
+                    interactive_coverage: ratio(i_touched, i_total),
                 }
             })
             .collect();
-        activities.sort_by(|a, b| b.nodes_seen.cmp(&a.nodes_seen));
+        activities.sort_by_key(|a| std::cmp::Reverse(a.nodes_seen));
 
         let total_nodes = self.nodes.len();
         let touched_nodes = self.nodes.values().filter(|n| n.touched > 0).count();
-        let node_coverage = if total_nodes == 0 {
-            0.0
-        } else {
-            touched_nodes as f32 / total_nodes as f32
-        };
+        let interactive_nodes = self.nodes.values().filter(|n| n.interactive).count();
+        let interactive_touched = self
+            .nodes
+            .values()
+            .filter(|n| n.interactive && n.touched > 0)
+            .count();
 
         let mut untouched: Vec<NodeStat> = self
             .nodes
@@ -428,19 +497,33 @@ impl Explorer {
             .filter(|n| n.touched == 0)
             .cloned()
             .collect();
-        untouched.sort_by(|a, b| b.seen.cmp(&a.seen));
+        // 可交互的排前面（那才是"还差什么没点到"），其次按出现次数
+        untouched.sort_by_key(|n| (std::cmp::Reverse(n.interactive), std::cmp::Reverse(n.seen)));
+        let untouched_interactive = untouched.iter().filter(|n| n.interactive).count();
 
         CoverageReport {
             activity_count: activities.len(),
             state_count: self.states.len(),
             total_nodes,
             touched_nodes,
-            node_coverage,
+            node_coverage: ratio(touched_nodes, total_nodes),
+            interactive_nodes,
+            interactive_touched,
+            interactive_coverage: ratio(interactive_touched, interactive_nodes),
             activities,
+            untouched_interactive,
             untouched_sample: untouched.into_iter().take(50).collect(),
         }
     }
+}
 
+/// 求比例，分母为 0 时返回 0（避免 NaN 进 JSON）
+fn ratio(part: usize, whole: usize) -> f32 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f32 / whole as f32
+    }
 }
 
 fn weighted_pick<'a>(cands: &[&'a Candidate], rng: &mut StdRng) -> &'a Action {
@@ -489,16 +572,35 @@ pub struct ActivityCoverage {
     pub nodes_seen: usize,
     pub nodes_touched: usize,
     pub coverage: f32,
+    /// 可交互控件口径（见 `CoverageReport::interactive_coverage`）
+    #[serde(default)]
+    pub interactive_seen: usize,
+    #[serde(default)]
+    pub interactive_touched: usize,
+    #[serde(default)]
+    pub interactive_coverage: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CoverageReport {
     pub activity_count: usize,
     pub state_count: usize,
+    /// 全部可见节点（含不可交互的纯布局容器）
     pub total_nodes: usize,
     pub touched_nodes: usize,
     pub node_coverage: f32,
+    /// 可交互控件（含文本叶子节点），这才是覆盖率的主指标 ——
+    /// 纯容器永远点不到，算进分母只会让数字永远上不去
+    #[serde(default)]
+    pub interactive_nodes: usize,
+    #[serde(default)]
+    pub interactive_touched: usize,
+    #[serde(default)]
+    pub interactive_coverage: f32,
     pub activities: Vec<ActivityCoverage>,
+    /// 未覆盖样本中可交互的个数（报告里优先展示这一批）
+    #[serde(default)]
+    pub untouched_interactive: usize,
     pub untouched_sample: Vec<NodeStat>,
 }
 
@@ -524,15 +626,19 @@ mod tests {
         }
     }
 
+    fn sig(h: &Hierarchy, activity: &str) -> String {
+        Hierarchy::state_sig_with(activity, &h.screen(), &h.visible_nodes())
+    }
+
     #[test]
     fn state_fingerprint_stable_and_content_sensitive() {
         let h1 = parse_hierarchy(SAMPLE).unwrap();
         let h2 = parse_hierarchy(SAMPLE).unwrap();
-        assert_eq!(h1.state_sig("com.demo/.Main"), h2.state_sig("com.demo/.Main"));
+        assert_eq!(sig(&h1, "com.demo/.Main"), sig(&h2, "com.demo/.Main"));
 
         let changed = SAMPLE.replace("条目B", "条目C");
         let h3 = parse_hierarchy(&changed).unwrap();
-        assert_ne!(h1.state_sig("com.demo/.Main"), h3.state_sig("com.demo/.Main"));
+        assert_ne!(sig(&h1, "com.demo/.Main"), sig(&h3, "com.demo/.Main"));
     }
 
     #[test]
@@ -549,11 +655,30 @@ mod tests {
             }
         }
         // 至少覆盖到：两个条目点击 + 输入框点击/长按/输入 + 列表上下滑动
-        assert!(seen.iter().any(|k| k.starts_with("click#com.demo:id/item_title")), "{:?}", seen);
-        assert!(seen.iter().any(|k| k.starts_with("swipe#com.demo:id/list#up")), "{:?}", seen);
-        assert!(seen.iter().any(|k| k.starts_with("swipe#com.demo:id/list#down")), "{:?}", seen);
+        assert!(
+            seen.iter()
+                .any(|k| k.starts_with("click#com.demo:id/item_title")),
+            "{:?}",
+            seen
+        );
+        assert!(
+            seen.iter()
+                .any(|k| k.starts_with("swipe#com.demo:id/list#up")),
+            "{:?}",
+            seen
+        );
+        assert!(
+            seen.iter()
+                .any(|k| k.starts_with("swipe#com.demo:id/list#down")),
+            "{:?}",
+            seen
+        );
         assert!(seen.iter().any(|k| k.starts_with("input#")), "{:?}", seen);
-        assert!(seen.iter().any(|k| k.starts_with("long_click#")), "{:?}", seen);
+        assert!(
+            seen.iter().any(|k| k.starts_with("long_click#")),
+            "{:?}",
+            seen
+        );
     }
 
     #[test]
@@ -584,5 +709,95 @@ mod tests {
         assert!(f.1 > t.1);
         let (f, t) = swipe_points(&r, SwipeDir::Left);
         assert!(f.0 > t.0);
+    }
+
+    /// 带一个「时钟」TextView 的界面：内容每帧都在变，结构不变
+    fn clock_hierarchy(time: &str) -> String {
+        format!(
+            r#"<hierarchy rotation="0" width="1080" height="2400">
+      <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.demo" bounds="[0,0][1080,2400]">
+        <node index="0" text="{time}" resource-id="" class="android.widget.TextView" package="com.demo" bounds="[40,40][300,100]" />
+        <node index="1" text="确定" resource-id="com.demo:id/ok" class="android.widget.Button" package="com.demo" clickable="true" bounds="[40,200][300,280]" />
+      </node>
+    </hierarchy>"#
+        )
+    }
+
+    #[test]
+    fn structural_sig_resists_dynamic_text() {
+        let times = ["09:01", "09:02", "09:03"];
+        let structs: Vec<String> = times
+            .iter()
+            .map(|t| {
+                let h = parse_hierarchy(&clock_hierarchy(t)).unwrap();
+                Hierarchy::struct_sig_with("com.demo/.Main", &h.screen(), &h.visible_nodes())
+            })
+            .collect();
+        assert!(
+            structs.iter().all(|s| *s == structs[0]),
+            "时钟文本变化不应改变结构签名: {structs:?}"
+        );
+
+        // 对照组：完整签名对文本敏感——这正是它会让状态爆炸的原因
+        let fulls: Vec<String> = times
+            .iter()
+            .map(|t| {
+                let h = parse_hierarchy(&clock_hierarchy(t)).unwrap();
+                Hierarchy::state_sig_with("com.demo/.Main", &h.screen(), &h.visible_nodes())
+            })
+            .collect();
+        assert!(
+            fulls.windows(2).all(|w| w[0] != w[1]),
+            "完整签名应当对文本敏感: {fulls:?}"
+        );
+    }
+
+    #[test]
+    fn structural_mode_avoids_state_explosion() {
+        // 时钟每步都在走：结构优先只应产生 1 个状态；精确模式会一路爆成 5 个，
+        // 结果是同一页面上的控件被反复当成「未探索动作」点击。
+        let count = |mode: StateMode| {
+            let mut ex = Explorer::new(
+                ExplorerConfig {
+                    package: "com.demo".into(),
+                    state_mode: mode,
+                    ..Default::default()
+                },
+                1,
+            );
+            for t in ["09:01", "09:02", "09:03", "09:04", "09:05"] {
+                let h = parse_hierarchy(&clock_hierarchy(t)).unwrap();
+                ex.observe(&h, "com.demo/.Main", 0);
+            }
+            ex.state_count()
+        };
+        assert_eq!(count(StateMode::Structural), 1);
+        assert_eq!(count(StateMode::Exact), 5);
+    }
+
+    #[test]
+    fn coverage_counts_only_interactive_targets() {
+        let h = parse_hierarchy(SAMPLE).unwrap();
+        let mut ex = Explorer::new(cfg(), 3);
+        ex.observe(&h, "com.demo/.Main", 0);
+        let c = ex.coverage();
+        // 根 FrameLayout 既不可交互也没有内容，属于纯容器，不该算进可交互分母
+        assert!(
+            c.interactive_nodes < c.total_nodes,
+            "可交互目标({}) 应少于全部节点({})",
+            c.interactive_nodes,
+            c.total_nodes
+        );
+        // SAMPLE 里的可交互目标：list(scrollable) + item_title ×2(同 key 合并) + et
+        assert_eq!(c.interactive_nodes, 3);
+        assert_eq!(c.interactive_touched, 0);
+        assert_eq!(c.interactive_coverage, 0.0);
+        // 未覆盖样本里可交互的应排在前面
+        assert!(c
+            .untouched_sample
+            .first()
+            .map(|n| n.interactive)
+            .unwrap_or(false));
+        assert_eq!(c.untouched_interactive, 3);
     }
 }
