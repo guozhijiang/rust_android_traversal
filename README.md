@@ -14,7 +14,7 @@
 | 动作类型 | click / long_click / swipe（上下左右）/ input（文本输入）/ back / keyevent / launch |
 | 步骤记录 | 每步一条 `steps.jsonl`，含动作、目标控件、坐标、前后 Activity、状态、耗时 |
 | 截图与标注 | 每步截图，并在**截图本体上**画出标记：点击圆环准星、长按双环、滑动箭头、输入框高亮、返回键角标，带步骤编号与类型文字 |
-| 异常捕获 | 实时流式 logcat，识别 Java 崩溃 / Native 崩溃 / ANR；自动抓取 dropbox、`/data/anr/traces.txt`、tombstone |
+| 异常捕获 | 实时流式 logcat，识别 Java 崩溃 / Native 崩溃 / ANR；自动抓取 dropbox、`/data/anr/traces.txt`、tombstone；**并抓一张异常现场截图**（崩溃那一刻屏幕什么样），报告里可点开大图 |
 | 覆盖率 | Activity 数、去重状态数、**可交互控件覆盖率**（纯布局容器不计入分母），并列出还没被点到的可交互控件 |
 | 报告 | 单文件 HTML（暗色）：指标卡、异常面板（可展开堆栈）、Activity 覆盖率表、操作时间线（缩略图点开大图）、按动作类型筛选 |
 

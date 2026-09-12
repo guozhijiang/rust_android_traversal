@@ -344,8 +344,15 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
         for mut inc in monitor.poll() {
             incident_seq += 1;
             inc.step = Some(step_index);
-            let fname = write_incident_report(dev, &dir, &inc, incident_seq);
+            let (fname, shot) =
+                write_incident_report(dev, &dir, &inc, incident_seq, opts.screenshot);
             inc.file = Some(fname);
+            if let Some((big, thumb)) = shot {
+                inc.shot = Some(big);
+                if !thumb.is_empty() {
+                    inc.shot_thumb = Some(thumb);
+                }
+            }
             println!(
                 "[异常] {} · 步骤 #{} · {} → incidents/",
                 inc.kind.cn(),
@@ -392,8 +399,14 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
     for mut inc in monitor.poll() {
         incident_seq += 1;
         inc.step = Some(step_index);
-        let fname = write_incident_report(dev, &dir, &inc, incident_seq);
+        let (fname, shot) = write_incident_report(dev, &dir, &inc, incident_seq, opts.screenshot);
         inc.file = Some(fname);
+        if let Some((big, thumb)) = shot {
+            inc.shot = Some(big);
+            if !thumb.is_empty() {
+                inc.shot_thumb = Some(thumb);
+            }
+        }
         incidents.push(inc);
     }
 
@@ -430,7 +443,22 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
 }
 
 /// 异常落盘：incidents/*.txt（logcat 块 + 有限次数的 dropbox / traces / tombstone 取证）
-fn write_incident_report(dev: &dyn Device, dir: &Path, inc: &Incident, seq: usize) -> String {
+fn write_incident_report(
+    dev: &dyn Device,
+    dir: &Path,
+    inc: &Incident,
+    seq: usize,
+    want_shot: bool,
+) -> (String, Option<(String, String)>) {
+    // 现场截图先抓：崩溃之后界面很快就变了（弹窗消失、应用退出、被系统回收），
+    // 这是「趁还看得见」的取证，所以不标注 —— 它不是某一步的操作，
+    // 而是异常发生那一刻屏幕上是什么样。
+    let shot = if want_shot && seq <= MAX_INCIDENT_SHOTS {
+        capture_incident_shot(dev, dir, inc.kind.as_str(), seq)
+    } else {
+        None
+    };
+
     let fname = format!(
         "incidents/{}_{:02}_{}.txt",
         inc.kind.as_str(),
@@ -485,9 +513,39 @@ fn write_incident_report(dev: &dyn Device, dir: &Path, inc: &Incident, seq: usiz
             }
         }
     }
+    if let Some((big, _)) = &shot {
+        body.push_str(&format!(
+            "
+---- 现场截图 ----
+{}
+",
+            big
+        ));
+    }
     let _ = std::fs::write(dir.join(&fname), &body);
-    fname
+    (fname, shot)
 }
+
+/// 异常现场截图：抓一张原始画面 + 一张缩略图，返回 (大图, 缩略图) 相对路径
+fn capture_incident_shot(
+    dev: &dyn Device,
+    dir: &Path,
+    kind: &str,
+    seq: usize,
+) -> Option<(String, String)> {
+    let png = dev.screencap().ok()?;
+    if png.len() < 8 {
+        return None;
+    }
+    let big = format!("incidents/{}_{:02}.png", kind, seq);
+    std::fs::write(dir.join(&big), &png).ok()?;
+    let thumb = format!("thumbs/{}_{:02}.png", kind, seq);
+    let ok = write_thumbnail(&png, &dir.join(&thumb), 260, 460).is_ok();
+    Some((big, if ok { thumb } else { String::new() }))
+}
+
+/// 最多为多少个异常抓现场截图（异常风暴时避免反复 screencap 拖慢遍历）
+const MAX_INCIDENT_SHOTS: usize = 20;
 
 /// 执行一个动作
 pub fn execute_action(dev: &dyn Device, action: &Action) -> Result<()> {
@@ -706,8 +764,17 @@ mod tests {
             "异常文件不存在"
         );
 
+        // 现场截图：崩溃后界面很快会变，这是趁还看得见时的取证
+        let shot = inc.shot.as_ref().expect("未抓取异常现场截图");
+        assert!(dir.join(shot).exists(), "现场截图文件不存在: {shot}");
+        assert!(
+            inc.shot_thumb.is_some(),
+            "现场截图缩略图未生成（报告里会加载全尺寸大图）"
+        );
+
         // 报告里应出现崩溃面板
         let html = std::fs::read_to_string(dir.join("report/index.html")).unwrap();
         assert!(html.contains("Java 崩溃"), "报告未展示崩溃");
+        assert!(html.contains("inc-shot"), "报告未展示异常现场截图");
     }
 }

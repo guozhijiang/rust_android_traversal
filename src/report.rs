@@ -105,15 +105,30 @@ fn build_html(s: &Session) -> String {
                 Some(st) => format!("<span class=\"chip\">步骤 #{}</span>", st),
                 None => String::new(),
             };
+            // 异常现场截图：崩溃那一刻屏幕上是什么样，比日志更直观
+            let shot_html = match (&inc.shot, &inc.shot_thumb) {
+                (Some(big), Some(thumb)) => format!(
+                    r#"<div class="inc-shot"><a href="../{}" target="_blank"><img loading="lazy" src="../{}" alt="异常现场"></a><span class="inc-shot-t">异常现场截图 · 点击看大图</span></div>"#,
+                    esc(big),
+                    esc(thumb)
+                ),
+                (Some(big), None) => format!(
+                    r#"<div class="inc-shot"><a href="../{}" target="_blank"><img loading="lazy" src="../{}" alt="异常现场"></a></div>"#,
+                    esc(big),
+                    esc(big)
+                ),
+                _ => String::new(),
+            };
             let _ = write!(
                 incidents,
-                r#"<details class="inc" {}><summary><span class="tag {}">{}</span><span class="inc-sum">{}</span><span class="inc-time">{}</span>{}</summary><pre class="stack">{}</pre>{}</details>"#,
+                r#"<details class="inc" {}><summary><span class="tag {}">{}</span><span class="inc-sum">{}</span><span class="inc-time">{}</span>{}</summary>{}<pre class="stack">{}</pre>{}</details>"#,
                 if i == 0 { "open" } else { "" },
                 kind_cls,
                 esc(&inc.kind_cn()),
                 esc(&inc.summary),
                 esc(&inc.time),
                 step_html,
+                shot_html,
                 esc(&inc.detail),
                 file_html
             );

@@ -52,6 +52,13 @@ pub struct Incident {
     pub file: Option<String>,
     /// 发生时的步骤序号
     pub step: Option<usize>,
+    /// 异常现场截图（相对 session 目录）。崩溃后界面很快会变，
+    /// 这张图记录的是「出问题时屏幕上是什么样」。
+    #[serde(default)]
+    pub shot: Option<String>,
+    /// 现场截图的缩略图（报告里用，点开看大图）
+    #[serde(default)]
+    pub shot_thumb: Option<String>,
 }
 
 impl Incident {
@@ -360,6 +367,8 @@ fn flush_block(
             detail,
             file: None,
             step: None,
+            shot: None,
+            shot_thumb: None,
         });
     }
 }
