@@ -20,6 +20,8 @@ rand = "0.8"
 # 只用本地时间格式化
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 ctrlc = "3.4"
+serde_yaml = "0.9"
+regex-lite = "0.1"
 
 [profile.release]
 opt-level = 2

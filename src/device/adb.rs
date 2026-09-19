@@ -201,11 +201,27 @@ impl AdbDevice {
         // 用 pid 区分，避免多个实例互相覆盖
         let path = format!("/data/local/tmp/.atraverse_dump_{}.xml", std::process::id());
         let _ = self.sh(&format!("rm -f {}", path), DEFAULT_TIMEOUT);
-        self.sh(&format!("uiautomator dump {}", path), DUMP_TIMEOUT)?;
-        let xml = String::from_utf8_lossy(&self.read_file(&path)?).to_string();
+        // 保留 dump 命令的输出：失败时它才是线索（典型 `ERROR: could not get idle state.`，
+        // 而且这句是打到 **stderr** 的，所以必须 2>&1 合并）
+        let out = self.sh(&format!("uiautomator dump {} 2>&1", path), DUMP_TIMEOUT)?;
+        let xml = match self.read_file(&path) {
+            Ok(b) => String::from_utf8_lossy(&b).to_string(),
+            Err(e) => {
+                let _ = self.sh(&format!("rm -f {}", path), DEFAULT_TIMEOUT);
+                bail!(
+                    "uiautomator dump 未生成文件({})；命令输出: {}",
+                    e,
+                    crate::util::truncate(out.trim(), 200)
+                )
+            }
+        };
         let _ = self.sh(&format!("rm -f {}", path), DEFAULT_TIMEOUT);
         if !xml.contains("<hierarchy") {
-            bail!("文件方式未返回控件树: {}", crate::util::truncate(&xml, 80));
+            bail!(
+                "文件方式未返回控件树: {}；命令输出: {}",
+                crate::util::truncate(&xml, 80),
+                crate::util::truncate(out.trim(), 200)
+            );
         }
         Ok(xml)
     }

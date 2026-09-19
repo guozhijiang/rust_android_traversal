@@ -1,0 +1,73 @@
+# 示例 L2 元素注册表 —— 对应 atraverse 内置的模拟设备（`--mock`）。
+#
+# 真实项目的这份文件由 tools/snapshot.py 从真机 dump 生成，
+# 语义（semantic / role）由 LLM 回填、人工复核后落在 kb/semantics/*.yaml 覆盖层里。
+#
+# 跑法：
+#   cargo run -- script examples/cases --kb examples/kb --mock
+screen: demo_main
+package: com.demo
+activity: ""
+screen_rect: [0, 0, 540, 1200]
+element_count: 4
+
+elements:
+- id: item_a
+  role: button
+  semantic: 第一条列表项
+  locators:
+    - { type: resource_id, value: "com.demo:id/item_title", confidence: 1.0 }
+    - { type: bounds_center, value: "0.5000,0.1250", confidence: 0.55 }
+    - { type: class_index, value: "TextView#0", confidence: 0.3 }
+  class: android.widget.TextView
+  text: ""
+  content_desc: ""
+  bounds: [0, 100, 540, 200]
+  flags: [clickable, long_clickable]
+  depth: 2
+  validations: []
+
+- id: search_box
+  role: input
+  semantic: 搜索框
+  locators:
+    - { type: resource_id, value: "com.demo:id/et", confidence: 1.0 }
+    - { type: content_desc, value: "搜索框", confidence: 0.85 }
+    - { type: bounds_center, value: "0.5000,0.9583", confidence: 0.55 }
+  class: android.widget.EditText
+  text: ""
+  content_desc: 搜索框
+  bounds: [20, 1120, 520, 1180]
+  flags: [clickable, long_clickable]
+  depth: 2
+  validations: []
+
+- id: detail_title
+  role: text
+  semantic: 详情页标题
+  locators:
+    - { type: resource_id, value: "com.demo:id/detail_title", confidence: 1.0 }
+    - { type: text, value: "详情标题", confidence: 0.9 }
+    - { type: bounds_center, value: "0.5000,0.1250", confidence: 0.55 }
+  class: android.widget.TextView
+  text: 详情标题
+  content_desc: ""
+  bounds: [0, 100, 540, 200]
+  flags: [clickable]
+  depth: 1
+  validations: []
+
+- id: back_btn
+  role: button
+  semantic: 返回按钮
+  locators:
+    - { type: resource_id, value: "com.demo:id/back", confidence: 1.0 }
+    - { type: text, value: "返回", confidence: 0.9 }
+    - { type: bounds_center, value: "0.5000,0.8750", confidence: 0.55 }
+  class: android.widget.Button
+  text: 返回
+  content_desc: ""
+  bounds: [0, 1000, 540, 1100]
+  flags: [clickable]
+  depth: 1
+  validations: []

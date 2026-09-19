@@ -12,7 +12,7 @@ use crate::monitor::{
 use crate::session::{append_step, write_session, RunConfig, Session, StepRecord};
 use crate::strategy::{Explorer, ExplorerConfig, StateMode};
 use crate::util::{elapsed_ms, ensure_dir, now_file_str, now_str, slug};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +113,11 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
     // 连续「取不到 Activity 且 dump 失败」的次数，用于识别设备掉线
     let mut dump_fail_streak: usize = 0;
     let mut incident_seq: usize = 0;
+    // 致命故障（设备掉线 / dump 长时间不可用）先记下来，**不要当场 bail**：
+    // 直接 bail 会让整轮采集作废（session.json 只在正常收尾时才写），
+    // 已经花掉的截图、logcat、异常取证全都白采。改为跳出循环走正常收尾落盘，
+    // 最后再把错误抛给调用方 —— 退出码仍然是失败，但数据保住了。
+    let mut fatal: Option<anyhow::Error> = None;
 
     println!(
         "[开始遍历] 目标 {} · 最长 {}s · 最多 {} 步",
@@ -161,11 +166,12 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
             // 既拿不到 Activity 又一直 dump 不出来，多半不是界面问题而是设备/连接断了。
             // 此时继续 press_back + 重启毫无意义，直接给出明确诊断。
             if dump_fail_streak >= 3 {
-                bail!(
+                fatal = Some(anyhow::anyhow!(
                     "连续 {} 次既取不到前台 Activity，又无法 dump 控件树：设备可能已断开连接 \
                      （USB 松动 / 授权失效 / adb 掉线）。请检查 adb devices 后重跑。",
                     dump_fail_streak
-                );
+                ));
+                break;
             }
             if !handled {
                 let _ = device::press_back(dev);
@@ -198,11 +204,12 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
                 dump_fail_count += 1;
                 eprintln!("[警告] dump 失败({}/5): {}", dump_fail_count, e);
                 if dump_fail_count >= 5 {
-                    bail!(
+                    fatal = Some(anyhow::anyhow!(
                         "连续 5 次无法 dump 控件树（最后一次：{}）。设备可能已断开或 uiautomator 不可用，\
                          请检查 adb devices 与设备是否处于解锁状态。",
                         e
-                    );
+                    ));
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
@@ -433,11 +440,23 @@ pub fn run(dev: &mut dyn Device, opts: RunOptions) -> Result<RunOutput> {
         incidents,
         coverage,
         transitions: ex.take_transitions(),
+        states: ex.states_in_order(),
         state_count: ex.state_count(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     write_session(&dir, &session)?;
     let report = crate::report::render(&session, &report_dir)?;
+
+    // 走到这里数据已落盘，再把中途的致命故障抛出去（退出码=失败，但产物完整）
+    if let Some(e) = fatal {
+        println!(
+            "[结束] 中途故障，已按现状落盘：{} 步 · 状态 {} · 异常 {}",
+            session.steps.len(),
+            session.state_count,
+            session.incidents.len()
+        );
+        return Err(e);
+    }
 
     Ok(RunOutput { session, report })
 }

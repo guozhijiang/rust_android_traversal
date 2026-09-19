@@ -1,0 +1,22 @@
+# 示例用例 IR —— 对应 atraverse 内置的模拟设备（`--mock`）。
+#
+# 注意这个文件里**没有一个坐标、没有一个选择器**：
+# 只写「做这个动作在哪个元素上」，定位器链由 Elements 层的 item_a 决定。
+# 定位策略演进（补 resource_id、换正则）不需要改用例。
+id: TC_DEMO_001
+title: 点列表项应进入详情页
+priority: P1
+tags: [demo, navigation]
+trace:
+  requirement: REQ-DEMO-01
+  pattern: navigation_tab
+  dimension: 正常流
+setup: []
+steps:
+  - { n: 1, action: click, locator: { id: item_a }, desc: 点击第一条列表项 }
+assertions:
+  - { n: 2, type: text_visible, expect: "详情标题", timeout_ms: 500, desc: 详情页标题出现 }
+  - { n: 3, type: element_exists, locator: { id: back_btn }, timeout_ms: 500, desc: 返回按钮存在 }
+  - { n: 4, type: text_equals, expect: "详情标题", timeout_ms: 500, desc: 标题文本精确匹配 }
+teardown:
+  - { action: click, locator: { id: back_btn }, desc: 还原到列表页 }

@@ -17,17 +17,20 @@
 | 异常捕获 | 实时流式 logcat，识别 Java 崩溃 / Native 崩溃 / ANR；自动抓取 dropbox、`/data/anr/traces.txt`、tombstone；**并抓一张异常现场截图**（崩溃那一刻屏幕什么样），报告里可点开大图 |
 | 覆盖率 | Activity 数、去重状态数、**可交互控件覆盖率**（纯布局容器不计入分母），并列出还没被点到的可交互控件 |
 | 报告 | 单文件 HTML（暗色）：指标卡、异常面板（可展开堆栈）、Activity 覆盖率表、操作时间线（缩略图点开大图）、按动作类型筛选 |
+| **用例执行** | `script` 子命令：按用例 IR（YAML）执行动作 + 断言，产出**用例级报告**（PASS / FAIL / BLOCKED），并复用 crash/ANR 监控 |
 
 ## 目录结构
 
 ```
 src/
-  main.rs             CLI：agent / run / build / deploy / pull / report / devices / probe
+  main.rs             CLI：agent / run / script / build / deploy / pull / report / devices / probe / demo
   device/
     mod.rs            Device trait + 高层操作（dump/input/screencap/activity…）+ DeviceInfo
     local.rs          手机端后端：直接 exec /system/bin 下的工具
     adb.rs            PC 端后端：通过 adb 转发（调试用）
+    mock.rs           模拟设备（无真机时验证链路）
   runner.rs           遍历主循环
+  script.rs           用例 IR 执行器（断言原语 + 定位器校验闸门 + 用例级报告）
   strategy.rs         高覆盖策略、状态图、覆盖率统计
   dump.rs             uiautomator dump XML 解析
   model.rs            Rect / UiNode / Hierarchy / Action
@@ -155,6 +158,95 @@ cargo run -- demo --state-mode exact --out sessions/cmp   # 用旧的状态指�
   异常现场截图不做标注，所以是纯色底。
 - 它只有两个页面，因此状态数只有 2；状态数不随步数增长是正常的，不是策略卡住了。
 
+### 按用例 IR 执行（`script`）
+
+遍历模式回答「覆盖率够不够」，`script` 回答「这几条用例过不过」。用例写成 YAML（中间表示），
+**不写坐标、不写选择器** —— 只引用元素注册表里的元素 id，运行时才展开该元素的分级定位器链。
+
+```bash
+# 1) 先只跑定位器校验闸门：不连设备，检查用例引用的元素是否都真实存在
+cargo run -- script cases/douyin --kb kb --dry-run
+
+# 2) 连真机执行
+cargo run -- script cases/douyin --kb kb --package com.ss.android.ugc.aweme
+
+# 单条用例 / 只跑某个子集 / 指定输出目录
+cargo run -- script cases/douyin/TC_DY_NAV_001.yaml --kb kb --package com.example
+cargo run -- script cases/douyin --kb kb --filter NAV --package com.example
+cargo run -- script cases/douyin --kb kb --out reports/nav -v
+```
+
+产物：`reports/script_<时间戳>/report.html`（用例级报告）、`cases.json`（机器可读）、`logcat.txt`。
+
+目录名若已存在会自动改名为 `script_<时间戳>_2`、`_3`……（时间戳只到秒，
+同一秒内连跑两次不会互相覆盖 —— 覆盖过一次，两个套件的报告只剩后一份，很容易被误导）。
+
+退出码：有失败或阻塞时为 1，可直接当 CI 门禁。
+
+#### 用例 IR 结构
+
+```yaml
+id: TC_DY_NAV_001
+title: 底部导航切换到「我」，应进入个人主页
+priority: P1
+tags: [navigation]
+trace:                                   # 需求追溯
+  requirement: REQ-DY-NAV-01
+  pattern: navigation_tab
+  dimension: 正常流
+setup:                                   # 预热（可选）：跑在 steps 之前
+  - { n: 0, action: wait, value: "2000" }
+steps:
+  - { n: 1, action: click, locator: { id: FrameLayout_4 }, desc: 点击底部「我」 }
+assertions:
+  - { n: 2, type: text_visible, expect: "编辑主页", timeout_ms: 6000 }
+  - { n: 3, type: element_exists, locator: { id: 底部Tab_首页 }, timeout_ms: 6000 }
+teardown:
+  - { action: click, locator: { id: FrameLayout_0 } }
+```
+
+- `locator.id` 是 `<kb>/elements/*.yaml` 里的元素 id（通常由 `tools/snapshot.py` 从真机 dump 生成）
+- 动作用 `click` / `long_click` / `input`（配 `value`）/ `swipe`（配 `direction`）/ `back` / `key`（配 `code`）/ `launch`（配 `component`）/ `wait`（配 `value`，毫秒）
+- `desc` 只是给人看的备注，会渲染进报告
+
+#### 断言原语
+
+| 类型 | 判据 |
+|---|---|
+| `text_visible` / `text_contains` | 任一节点的 text 或 content-desc **包含** `expect` |
+| `text_equals` | 任一节点的 text 或 content-desc **等于** `expect` |
+| `element_exists` / `element_absent` | 元素在 / 不在当前页面（**只认语义定位器**） |
+| `activity_is` | 前台 Activity 含 `expect` |
+| `no_crash` | 本条用例执行期间没有归因到被测应用的 crash / ANR（需 `--package`，否则跳过） |
+
+断言会一直重试到 `timeout_ms`（默认 4000）。**重试只改变等待时长，不降低判据严格程度。**
+
+#### ★ 定位器校验闸门
+
+执行前，用例里每个元素引用都会回查 L2 元素注册表。命中不了就 `BLOCKED` 且**不执行**：
+
+- 引用的元素 id 不存在 → 拦住（LLM 幻觉出的 `resource-id` 主要死在这里）
+- 断言用的元素**只有位置 / 序号定位器** → 拦住（下面解释）
+- 用例没有任何断言 → 拦住（没有判据的用例不算测试）
+
+**为什么存在性断言不许用位置 / 序号定位器**：位置只能回答「该点在哪」，回答不了「控件在不在」；
+`class_index` 更糟 —— 同 class 的节点一大把（一个详情页几十个 `View`），它几乎总能匹配到某个无关节点，
+于是断言**永远通过**。假阳性比 FAIL 危险得多：FAIL 会有人去查，假的 PASS 会让一条根本没测到的用例看起来是绿的。
+
+同理，**断言全部被跳过的用例记为 `SKIP` 而不是 `PASS`** —— 没验证过就不能算绿。
+
+#### 定位器分级
+
+元素在 `kb/elements/*.yaml` 里带一条**分级定位器链**，按可信度从高到低尝试：
+
+```
+resource_id  >  动态文本正则(content_desc_regex / text_regex)  >  原文 content-desc  >  text
+             >  bounds_center（屏幕相对位置）  >  class_index（按 dump 序号，最后兜底）
+```
+
+后两级只在**动作**里可用（它们能给出坐标），在**存在性断言**里被闸门拦掉。
+动态 content-desc 必须正则化，否则内容一变就失效：「喜欢5.4万」→ `^未点赞，喜欢[\d.万亿]+，按钮$`。
+
 ### 其它命令
 
 ```bash
@@ -179,6 +271,15 @@ cargo run -- report sessions/xxx          # 重新生成 HTML 报告
 | `--max-relaunch` | 30 | 应用最多重启次数 |
 | `--text-pool` | 内置 | 一行一个候选文本，用于填充 EditText |
 | `--no-screenshot` / `--no-annotate` / `--keep-raw` | - | 截图相关开关 |
+| `--keep-animations` | 关 | **默认遍历期间临时关闭系统动画**，结束（含失败）后自动恢复原值 |
+
+> **为什么要关动画**：`uiautomator dump` 必须等到 UI 空闲才拿控件树。页面有持续动画时
+> （视频在播、转场没结束、无限循环动画）永远等不到 idle，dump 直接报
+> `ERROR: could not get idle state.` 失败，失败前还要白等十几秒。
+> 实测抖音推荐流（视频在播）：动画开启时 dump **3/3 失败**（每次约 11.4s）；
+> 三个 `*_animation_scale` 置 0 后，同一页面 **3/3 成功**（每次约 3s）。
+> 这是通用手段（Appium / UiAutomator2 也这么做），与应用无关。
+> 若进程被强杀（`kill -9`）来不及恢复，设备上的动画开关会残留为 0。
 
 ## 覆盖率是怎么算的
 

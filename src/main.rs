@@ -18,6 +18,7 @@ mod model;
 mod monitor;
 mod report;
 mod runner;
+mod script;
 mod session;
 mod strategy;
 mod util;
@@ -109,6 +110,9 @@ enum Cmd {
         #[arg(short, long)]
         serial: Option<String>,
     },
+
+    /// 【PC 端】按用例 IR 执行并断言，产出用例级报告（区别于遍历报告）
+    Script(ScriptArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -208,6 +212,55 @@ struct RunArgs {
     /// PC 端模式：不部署到手机，直接在电脑上用 adb 驱动（调试用）
     #[arg(long)]
     host: bool,
+
+    /// 保留系统动画（默认遍历期间临时关闭再恢复，见 disable_animations 注释）
+    #[arg(long)]
+    keep_animations: bool,
+}
+
+#[derive(Args, Debug)]
+struct ScriptArgs {
+    /// 用例 IR 文件或目录（目录则按文件名顺序执行其中所有 .yaml）
+    target: PathBuf,
+
+    /// 知识库根目录，需要其中的 elements/*.yaml 作为 L2 元素注册表
+    #[arg(long, default_value = "kb")]
+    kb: PathBuf,
+
+    /// 报告输出目录（默认 reports/script_<时间戳>）
+    #[arg(short, long)]
+    out: Option<PathBuf>,
+
+    /// 设备序列号
+    #[arg(short, long)]
+    serial: Option<String>,
+
+    /// 被测应用包名：用于把崩溃日志归因到应用；不指定则 no_crash 断言跳过
+    #[arg(short, long)]
+    package: Option<String>,
+
+    /// 只跑定位器校验闸门，不连设备（校验完即退出）
+    #[arg(long)]
+    dry_run: bool,
+
+    /// 用内置模拟设备执行（无需真机，用于验证链路与查看用例级报告样式）
+    #[arg(long)]
+    mock: bool,
+
+    /// 动作后的等待时长，毫秒（断言自身还有超时重试）
+    #[arg(long, default_value_t = 1000)]
+    settle: u64,
+
+    /// 只执行 id 或标题包含该子串的用例
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// 保留系统动画（默认执行期间临时关闭再恢复）
+    #[arg(long)]
+    keep_animations: bool,
+
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn main() -> Result<()> {
@@ -235,6 +288,7 @@ fn main() -> Result<()> {
             state_mode,
         } => cmd_demo(out.as_deref(), steps, open, &state_mode),
         Cmd::Probe { serial } => cmd_probe(serial),
+        Cmd::Script(a) => cmd_script(a),
     }
 }
 
@@ -274,6 +328,25 @@ fn cmd_run(a: RunArgs) -> Result<()> {
     }
     let adb = device::AdbDevice::new(a.serial.clone());
     adb.wait_for_device(std::time::Duration::from_secs(30))?;
+
+    // 遍历期间关掉系统动画，无论成功失败都在结束后恢复原值
+    let anim_prev = if a.keep_animations {
+        None
+    } else {
+        let prev = device::disable_animations(&adb);
+        println!("[动画] 已临时关闭系统动画（结束自动恢复；保留请加 --keep-animations）");
+        Some(prev)
+    };
+    let result = do_run(&a);
+    if let Some(prev) = anim_prev {
+        device::restore_animations(&adb, &prev);
+    }
+    result
+}
+
+/// 真正跑一轮遍历：`cmd_run` 只负责设备前置检查与动画开关。
+fn do_run(a: &RunArgs) -> Result<()> {
+    let adb = device::AdbDevice::new(a.serial.clone());
 
     // ---- PC 端（adb 驱动）模式
     if a.host {
@@ -351,24 +424,36 @@ fn cmd_run(a: RunArgs) -> Result<()> {
     }
 
     println!("[拉取] {} -> {}", remote_out, local_out.display());
-    util::ensure_dir(&local_out)?;
-    adb.pull(
-        &remote_out,
-        local_out.parent().unwrap_or(std::path::Path::new(".")),
-    )
-    .context("拉取结果失败（若 /sdcard 不可写，可改用 --remote-dir /data/local/tmp/atraverse）")?;
+    // 注意：不要先创建 local_out 本身。
+    // adb pull 的语义是「目标不存在 → 把 SRC 的内容直接放进目标」，
+    // 「目标已存在 → 在目标下再套一层 SRC 的目录名」。
+    // 之前这里 ensure_dir(&local_out) 后再 pull 到 local_out.parent()，
+    // 结果数据落到了 `sessions/<设备会话名>`（默认名），
+    // 而 --out 指定的目录始终是空的，后面读 session.json 直接 os error 2。
+    if let Some(parent) = local_out.parent() {
+        if !parent.as_os_str().is_empty() {
+            util::ensure_dir(parent)?;
+        }
+    }
+    adb.pull(&remote_out, &local_out).context(
+        "拉取结果失败（若 /sdcard 不可写，可改用 --remote-dir /data/local/tmp/atraverse）",
+    )?;
 
-    let pulled = if local_out.join("session.json").exists() {
+    // adb pull 目标已存在时会多套一层目录名，兼容这种情况
+    let dir = if local_out.join("session.json").exists() {
         local_out.clone()
-    } else {
-        // adb pull 目标已存在时会多套一层目录名
+    } else if local_out.join(&name).join("session.json").exists() {
         local_out.join(&name)
-    };
-    let dir = if pulled.join("session.json").exists() {
-        pulled
     } else {
         local_out.clone()
     };
+    if !dir.join("session.json").exists() {
+        bail!(
+            "拉取后未在 {} 找到 session.json（设备端目录 {}）",
+            dir.display(),
+            remote_out
+        );
+    }
 
     let s = session::read_session(&dir)?;
     let report = report::render(&s, &dir.join("report"))?;
@@ -397,6 +482,83 @@ fn build_opts(a: &AgentArgs, output: PathBuf, stop: Arc<AtomicBool>) -> Result<r
         verbose: a.verbose,
         stop,
     })
+}
+
+// ---------------------------------------------------------------- 用例执行
+
+/// 按用例 IR 执行并断言。
+///
+/// 与 `run` 共用同一套设备前置与动画开关：用例执行的每条断言都要 dump 一次页面，
+/// 不关动画的话每次断言都要先空转十几秒再失败（见 `device::disable_animations`）。
+fn cmd_script(a: ScriptArgs) -> Result<()> {
+    let opts = script::ScriptOptions {
+        kb: a.kb.clone(),
+        target: a.target.clone(),
+        out: a.out.clone(),
+        package: a.package.clone(),
+        settle_ms: a.settle,
+        filter: a.filter.clone(),
+        dry_run: a.dry_run,
+        verbose: a.verbose,
+    };
+
+    // ---- 只做定位器校验：完全不碰设备，可在没有手机时跑
+    if a.dry_run {
+        let run = script::run(&opts, None)?;
+        if run.has_problem() {
+            bail!(
+                "定位器校验未全部通过：阻塞 {} 条（详见上方输出）",
+                run.summary.blocked
+            );
+        }
+        return Ok(());
+    }
+
+    // ---- 模拟设备：无真机也能看到完整的用例级报告
+    if a.mock {
+        use device::mock::MockDevice;
+        let scratch =
+            std::env::temp_dir().join(format!("atraverse_script_mock_{}", std::process::id()));
+        let mut dev = MockDevice::new(&scratch);
+        println!("[模拟] 使用内置模拟设备执行（无真机；被测 App 固定为 com.demo）");
+        let run = script::run(&opts, Some(&mut dev))?;
+        if run.has_problem() {
+            bail!(
+                "用例未全部通过：失败 {} / 阻塞 {}（共 {} 条）",
+                run.summary.fail,
+                run.summary.blocked,
+                run.summary.total
+            );
+        }
+        return Ok(());
+    }
+
+    let mut adb = device::AdbDevice::new(a.serial.clone());
+    adb.wait_for_device(std::time::Duration::from_secs(30))?;
+
+    let anim_prev = if a.keep_animations {
+        None
+    } else {
+        let prev = device::disable_animations(&adb);
+        println!("[动画] 已临时关闭系统动画（结束自动恢复；保留请加 --keep-animations）");
+        Some(prev)
+    };
+
+    let result = script::run(&opts, Some(&mut adb));
+    if let Some(prev) = anim_prev {
+        device::restore_animations(&adb, &prev);
+    }
+
+    let run = result?;
+    if run.has_problem() {
+        bail!(
+            "用例未全部通过：失败 {} / 阻塞 {}（共 {} 条）",
+            run.summary.fail,
+            run.summary.blocked,
+            run.summary.total
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 其它子命令
@@ -632,7 +794,11 @@ fn resolve_target(adb: &device::AdbDevice) -> Result<String> {
 }
 
 fn target_binary(target: &str) -> PathBuf {
-    let name = if cfg!(windows) {
+    // 交叉编译产物是否带 .exe 由 **target** 决定，与编译它的 host 无关。
+    // Android / Linux / macOS 目标的产物一律没有后缀，只有 windows target 才有。
+    // 这里原先判断的是 cfg!(windows)（host），于是 Windows 上 --no-build 会去找
+    // target/aarch64-linux-android/release/atraverse.exe，必然报「未找到设备端二进制」。
+    let name = if target.contains("windows") {
         "atraverse.exe"
     } else {
         "atraverse"

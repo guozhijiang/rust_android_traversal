@@ -48,6 +48,31 @@ pub fn ensure_dir(p: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 在 `parent` 下取一个**尚不存在**的目录名，避免两次运行挤进同一个目录。
+///
+/// 优先用 `stem` 本身；被占用则依次尝试 `{stem}_2`、`{stem}_3`……最多到 999，
+/// 全都占用时退回带纳秒后缀的名字（几乎不可能走到）。
+///
+/// 存在的理由：报告目录名的时间戳只到**秒**。同一秒内连跑两次
+/// （实测场景：先跑正样本、紧接着跑负样本校验闸门）会落进同一个目录，
+/// 后一次的报告把前一次整个覆盖掉 —— 两次结果只剩一份，排查时非常容易被误导。
+pub fn unique_dir(parent: &Path, stem: &str) -> std::path::PathBuf {
+    let first = parent.join(stem);
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000u32 {
+        let cand = parent.join(format!("{stem}_{n}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    parent.join(format!(
+        "{stem}_{}",
+        chrono::Local::now().format("%Y%m%d_%H%M%S_%f")
+    ))
+}
+
 /// 去掉 adb 输出尾部的 `\r\n`（Windows 上 adb 会带 `\r\n`）
 pub fn trim_output(mut s: String) -> String {
     while s.ends_with('\n') || s.ends_with('\r') || s.ends_with(' ') {
@@ -87,5 +112,56 @@ pub fn slug(s: &str) -> String {
         "unknown".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每个测试用独立临时目录，避免并发跑测试时互相踩
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("atraverse_util_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn unique_dir_returns_stem_when_free() {
+        let root = tmp_root("free");
+        let d = unique_dir(&root, "script_20260919_104535");
+        assert_eq!(d.file_name().unwrap(), "script_20260919_104535");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unique_dir_avoids_collision_without_overwriting() {
+        let root = tmp_root("collide");
+        let stem = "script_20260919_104535";
+
+        // 第一次拿到原名，建出来；第二次必须换名，不能指向同一个目录
+        let d1 = unique_dir(&root, stem);
+        std::fs::create_dir_all(&d1).unwrap();
+        let d2 = unique_dir(&root, stem);
+        assert_ne!(d1, d2, "同名目录已存在时必须换名");
+        assert_eq!(d2.file_name().unwrap(), "script_20260919_104535_2");
+
+        std::fs::create_dir_all(&d2).unwrap();
+        let d3 = unique_dir(&root, stem);
+        assert_eq!(d3.file_name().unwrap(), "script_20260919_104535_3");
+        std::fs::create_dir_all(&d3).unwrap();
+
+        // 三个都应真实存在且互不相同
+        assert!(d1.exists() && d2.exists() && d3.exists());
+        assert_ne!(d1, d3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn slug_strips_unsafe_chars() {
+        assert_eq!(slug("com.ss.android.ugc.aweme"), "com_ss_android_ugc_aweme");
+        assert_eq!(slug("///"), "unknown");
+        assert_eq!(slug("a b\tc"), "abc");
     }
 }

@@ -1,0 +1,21 @@
+# 示例用例 IR —— 不会假设自己从哪个页面开始。
+#
+# setup 里先按一次返回键把应用拉回列表页，再验证首页结构。
+# 这就是「预热 / 复位步骤」的用法：与其让用例依赖执行顺序，
+# 不如显式把它复位到已知状态 —— 否则失败到底是 App 的问题还是上一条用例的残留，说不清。
+id: TC_DEMO_002
+title: 列表页应展示搜索框
+priority: P2
+tags: [demo, ui_structure]
+trace:
+  requirement: REQ-DEMO-04
+  pattern: ui_smoke
+  dimension: 结构完整性
+setup:
+  - { n: 0, action: key, code: 4, desc: 先回到列表页 }
+  - { n: 0, action: wait, value: "200", desc: 等页面稳定 }
+steps: []
+assertions:
+  - { n: 1, type: element_exists, locator: { id: search_box }, timeout_ms: 500, desc: 搜索框 }
+  - { n: 2, type: element_absent, locator: { id: detail_title }, timeout_ms: 500, desc: 详情标题不应在列表页 }
+teardown: []

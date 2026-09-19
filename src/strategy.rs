@@ -92,6 +92,14 @@ pub struct StateRecord {
     pub node_count: usize,
     pub interactive_count: usize,
     pub tried_count: usize,
+    /// 该状态的「控件签名」：状态里**可交互控件**的稳定指纹集合（排序去重）。
+    ///
+    /// 状态 id 是整棵可见树的指纹，内容一变就换 id —— 在抖音这种无限推荐流上，
+    /// 每刷一次都是「新状态」，页面清单会退化成一条状态链。
+    /// 这组 key 是页面的语义骨架（按钮/输入框/Tab 的身份），内容帧之间基本不变，
+    /// 下游（L1 页面层）据此可以把同一页面的多个状态归并成一个页面。
+    #[serde(default)]
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +213,16 @@ impl Explorer {
             node_count: h.node_count(),
             interactive_count,
             tried_count: 0,
+            keys: {
+                let mut ks: Vec<String> = visible
+                    .iter()
+                    .filter(|n| n.coverage_target())
+                    .map(|n| n.key())
+                    .collect();
+                ks.sort();
+                ks.dedup();
+                ks
+            },
         });
         st.visits += 1;
         if is_new {
@@ -246,6 +264,17 @@ impl Explorer {
 
     pub fn state_count(&self) -> usize {
         self.states.len()
+    }
+
+    /// 按首次出现顺序返回状态记录。
+    ///
+    /// 主要供会话落盘使用：把每个状态的控件签名一并写出去，
+    /// 下游才能把「同一页面的不同内容帧」归并成页面（见 `StateRecord::keys`）。
+    pub fn states_in_order(&self) -> Vec<StateRecord> {
+        self.state_order
+            .iter()
+            .filter_map(|id| self.states.get(id).cloned())
+            .collect()
     }
 
     pub fn same_streak(&self) -> usize {

@@ -320,6 +320,110 @@ fn incident_fingerprint(detail: &str) -> Option<String> {
     None
 }
 
+/// 形如包名的字符串：有点号、只含字母数字下划线和点、以字母开头。
+fn is_pkg_like(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.contains('.')
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+}
+
+/// 从异常块里指出**到底是谁崩了**。
+///
+/// 这是能不能把事件归因到被测应用的关键：收集窗口有几百行，被测 App 在前台时
+/// 日志里到处是它的包名，靠「详情里出现过包名」判断必然命中——**别的进程崩了也会
+/// 被算到被测应用头上**。所以要显式解析崩溃进程，而不是扫字符串。
+///
+/// 各来源的写法：
+///  - Java 崩溃：`E AndroidRuntime: Process: com.demo, PID: 1234`
+///  - events buffer：`am_crash: [pid,userId,<pkg>,...]` / `am_anr: [...,<pkg>,...]`（包名都在第 3 个字段）
+///  - ANR：`ANR in com.demo`
+///  - Native：`>>> com.demo <<<`
+///
+/// 解析不出来时返回 `None`（例如裸 `app_process` 起的手工 shell 进程，见 `is_tool_crash`）。
+fn attribute_package(detail: &str) -> Option<String> {
+    for line in detail.lines() {
+        if let Some(i) = line.find("Process:") {
+            let rest = &line[i + "Process:".len()..];
+            let tok = rest
+                .trim_start()
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            if is_pkg_like(tok) {
+                return Some(tok.to_string());
+            }
+        }
+    }
+
+    for line in detail.lines() {
+        if line.contains("am_crash") || line.contains("am_anr") {
+            if let (Some(lb), Some(rb)) = (line.find('['), line.find(']')) {
+                if rb > lb {
+                    let fields: Vec<&str> = line[lb + 1..rb].split(',').collect();
+                    if let Some(cand) = fields.get(2) {
+                        let cand = cand.trim();
+                        if is_pkg_like(cand) {
+                            return Some(cand.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for line in detail.lines() {
+        if let Some(i) = line.find("ANR in ") {
+            let tok = line[i + "ANR in ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if is_pkg_like(tok) {
+                return Some(tok.to_string());
+            }
+        }
+    }
+
+    if let Some(i) = detail.find(">>> ") {
+        let rest = &detail[i + 4..];
+        if let Some(j) = rest.find(" <<<") {
+            let tok = rest[..j].trim();
+            if is_pkg_like(tok) {
+                return Some(tok.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// 判断这个异常块是不是「我们自己的工具」崩的。
+///
+/// `uiautomator dump` / `am` 这类命令是裸 `app_process`，不是 zygote 拉起的应用，
+/// 所以崩溃时**没有 `Process: <pkg>` 行**，走的却是同一条 AndroidRuntime 崩溃路径，
+/// 打出来的同样是 `FATAL EXCEPTION`。典型现场：
+///
+/// ```text
+/// E AndroidRuntime: FATAL EXCEPTION: main
+/// E AndroidRuntime: PID: 32613
+/// E AndroidRuntime: java.lang.IllegalStateException: UiAutomationService ... already registered!
+/// E AndroidRuntime:     at com.android.commands.uiautomator.DumpCommand.run(DumpCommand.java:78)
+/// ```
+///
+/// 实测（抖音遍历，2026-09-16）：一份 logcat 里一条 `Process:`、一条 `am_crash` 都没有，
+/// 却有 4 次这种 dump 进程崩溃 —— 全部被记成了被测应用的崩溃。
+fn is_tool_crash(detail: &str) -> bool {
+    // 用「行内包含」而不是「行首匹配」：logcat 的堆栈帧前面还带着
+    // `09-16 23:44:17.719 32613 32613 E AndroidRuntime: \tat com...`，
+    // 行首是时间戳，不是 `at`。
+    const TOOL_FRAMES: &[&str] = &["at com.android.commands.", "at com.android.uiautomator."];
+    detail
+        .lines()
+        .any(|l| TOOL_FRAMES.iter().any(|f| l.contains(f)))
+}
+
 /// 正在收集中的异常块
 struct Block {
     kind: IncidentKind,
@@ -347,30 +451,52 @@ fn flush_block(
     if detail.trim().is_empty() {
         return;
     }
-    if package.is_empty() || detail.contains(package) || b.summary.contains(package) {
-        // 同类型 + 同包名 + 同异常特征，且在去重窗口内 → 判定为同一事件走了另一条日志通道
-        let fp = incident_fingerprint(&detail).unwrap_or_else(|| "unknown".to_string());
-        let key = format!("{:?}|{}|{}", b.kind, package, fp);
-        let now = Instant::now();
-        if recent
-            .get(&key)
-            .is_some_and(|t| now.duration_since(*t) < DEDUP_WINDOW)
-        {
+    // ---- 归因：先剔掉「不是被测应用崩的」----
+    // 注意不要退回「详情里出现过包名就算数」：收集窗口几百行，被测 App 在前台时
+    // 它的包名到处都有，这个判据等价于「一律算数」。
+    if !package.is_empty() {
+        // 我们自己的采集工具崩的（uiautomator dump / am 这类裸 app_process）
+        if is_tool_crash(&detail) {
             return;
         }
-        recent.insert(key, now);
-        let _ = tx.send(Incident {
-            kind: b.kind,
-            time: now_str(),
-            package: package.to_string(),
-            summary: crate::util::truncate(b.summary.trim(), 160),
-            detail,
-            file: None,
-            step: None,
-            shot: None,
-            shot_thumb: None,
-        });
+        match attribute_package(&detail) {
+            // 能解析出崩溃进程 → 必须就是目标包
+            Some(p) => {
+                if p != package {
+                    return;
+                }
+            }
+            // 解析不出来（没有 `Process:` 行）→ 退回文本启发式
+            None => {
+                if !detail.contains(package) && !b.summary.contains(package) {
+                    return;
+                }
+            }
+        }
     }
+
+    // 同类型 + 同包名 + 同异常特征，且在去重窗口内 → 判定为同一事件走了另一条日志通道
+    let fp = incident_fingerprint(&detail).unwrap_or_else(|| "unknown".to_string());
+    let key = format!("{:?}|{}|{}", b.kind, package, fp);
+    let now = Instant::now();
+    if recent
+        .get(&key)
+        .is_some_and(|t| now.duration_since(*t) < DEDUP_WINDOW)
+    {
+        return;
+    }
+    recent.insert(key, now);
+    let _ = tx.send(Incident {
+        kind: b.kind,
+        time: now_str(),
+        package: package.to_string(),
+        summary: crate::util::truncate(b.summary.trim(), 160),
+        detail,
+        file: None,
+        step: None,
+        shot: None,
+        shot_thumb: None,
+    });
 }
 
 impl Drop for LogcatMonitor {
@@ -602,5 +728,82 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn parses_crashing_package() {
+        assert_eq!(
+            attribute_package("E AndroidRuntime: Process: com.demo, PID: 1234"),
+            Some("com.demo".to_string())
+        );
+        // events buffer 第 3 个字段是包名
+        assert_eq!(
+            attribute_package(
+                "I am_crash: [1234,0,com.demo,0,java.lang.NullPointerException,Unknown]"
+            ),
+            Some("com.demo".to_string())
+        );
+        assert_eq!(
+            attribute_package("E ActivityManager: ANR in com.demo (com.demo/.Main)"),
+            Some("com.demo".to_string())
+        );
+        assert_eq!(
+            attribute_package("F DEBUG: >>> com.demo <<<"),
+            Some("com.demo".to_string())
+        );
+        // 裸 app_process（uiautomator dump）没有 Process: 行 → 归因不出来
+        assert_eq!(attribute_package("E AndroidRuntime: PID: 32613"), None);
+    }
+
+    /// 实测回归（抖音遍历 2026-09-16）：`uiautomator dump` 进程因
+    /// 「UiAutomationService already registered!」崩溃，被测 App 正在前台。
+    /// 崩溃块后面紧跟的 300 行窗口里落进了抖音自己 `E/ViewRootImpl` 的
+    /// 无障碍告警栈（含 `com.ss.android.ugc.aweme.*` 帧），旧的
+    /// 「详情含包名即认定」于是把它记成了**抖音崩溃**。
+    ///
+    /// 真实数据：整份 logcat 里 0 条 `Process:`、0 条 `am_crash`，
+    /// 却有 4 次 dump 进程崩溃，全部被误报。
+    #[test]
+    fn ignores_uiautomator_dump_crash() {
+        let log = "09-16 23:44:17.719 32613 32613 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                   09-16 23:44:17.719 32613 32613 E AndroidRuntime: PID: 32613\n\
+                   09-16 23:44:17.719 32613 32613 E AndroidRuntime: java.lang.IllegalStateException: UiAutomationService android.accessibilityservice.IAccessibilityServiceClient$Stub$Proxy@d827670already registered!\n\
+                   09-16 23:44:17.719 32613 32613 E AndroidRuntime: \tat com.android.uiautomator.core.UiAutomationShellWrapper.connect(UiAutomationShellWrapper.java:36)\n\
+                   09-16 23:44:17.719 32613 32613 E AndroidRuntime: \tat com.android.commands.uiautomator.DumpCommand.run(DumpCommand.java:78)\n\
+                   09-16 23:44:18.943 32132 32132 E ViewRootImpl: \tat com.ss.android.ugc.aweme.platform.collect.base.CollectClient.bind(SourceFile:84345063)\n\
+                   09-16 23:44:18.943 32132 32132 E ViewRootImpl: \tat com.ss.android.ugc.aweme.collection.FeedCollectPresenterV2.LJIILJJIL(SourceFile:34013286)\n";
+
+        let got = collect(log, "com.ss.android.ugc.aweme");
+        assert!(
+            got.is_empty(),
+            "dump 工具自己的崩溃被记成了被测应用崩溃: {:?}",
+            got.iter().map(|i| i.summary.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 反向约束：窗口里误入的第三方 `ViewRootImpl` 告警栈不影响真正的应用崩溃被识别。
+    #[test]
+    fn still_reports_real_app_crash_among_noise() {
+        let log = "09-16 23:44:18.943 32132 32132 E ViewRootImpl: \tat com.other.app.Thing.run(SourceFile:1)\n\
+                   09-16 23:44:19.100  1234  1234 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                   09-16 23:44:19.101  1234  1234 E AndroidRuntime: Process: com.ss.android.ugc.aweme, PID: 1234\n\
+                   09-16 23:44:19.102  1234  1234 E AndroidRuntime: java.lang.NullPointerException\n\
+                   09-16 23:44:19.103  1234  1234 E AndroidRuntime: \tat com.ss.android.ugc.aweme.Main.onClick(Main.java:42)\n";
+
+        let got = collect(log, "com.ss.android.ugc.aweme");
+        assert_eq!(got.len(), 1, "真崩溃漏报了: {got:?}");
+        assert!(got[0].detail.contains("Main.onClick"));
+    }
+
+    /// 别的应用崩了（有明确 `Process:` 行）不能算到目标应用头上。
+    #[test]
+    fn does_not_attribute_other_app_crash() {
+        let log = "09-16 23:44:19.100  1234  1234 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                   09-16 23:44:19.101  1234  1234 E AndroidRuntime: Process: com.other.app, PID: 1234\n\
+                   09-16 23:44:19.102  1234  1234 E AndroidRuntime: java.lang.NullPointerException\n\
+                   09-16 23:44:19.103  1234  1234 E ActivityManager: Displayed com.ss.android.ugc.aweme/.Main\n";
+
+        let got = collect(log, "com.ss.android.ugc.aweme");
+        assert!(got.is_empty(), "别的应用崩溃被算到了目标应用: {got:?}");
     }
 }

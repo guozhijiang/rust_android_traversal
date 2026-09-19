@@ -7,6 +7,9 @@
 # 运行产出（会话、截图、报告）
 /sessions
 
+# 用例执行产出（`script` 子命令默认落这里）
+/reports
+
 # 本地工具数据
 /.workbuddy
 

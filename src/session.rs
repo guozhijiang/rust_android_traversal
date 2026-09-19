@@ -3,7 +3,7 @@
 use crate::device::DeviceInfo;
 use crate::model::{Action, TargetInfo};
 use crate::monitor::Incident;
-use crate::strategy::{CoverageReport, Transition};
+use crate::strategy::{CoverageReport, StateRecord, Transition};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -118,6 +118,13 @@ pub struct Session {
     pub coverage: CoverageReport,
     /// 状态迁移图：某一步的动作把状态从 from 带到了 to
     pub transitions: Vec<Transition>,
+    /// 状态明细（含每个状态的控件签名）。
+    ///
+    /// `state_count` 只是数量；这里把状态本身写出来，下游才能做页面归并 ——
+    /// 状态 id 是整棵树的结构指纹，动态内容应用上同一页面会产生很多 id，
+    /// 必须靠 `StateRecord::keys` 把语义相同的状态合并回一个页面。
+    #[serde(default)]
+    pub states: Vec<StateRecord>,
     pub state_count: usize,
     pub version: String,
 }

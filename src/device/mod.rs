@@ -274,6 +274,62 @@ pub fn press_back<D: Device + ?Sized>(d: &D) -> Result<()> {
     input_keyevent(d, 4)
 }
 
+// ---- 系统动画开关
+
+/// 三个动画缩放开关。置 0 后系统不再播放窗口 / 转场 / 属性动画。
+pub const ANIM_KEYS: [&str; 3] = [
+    "window_animation_scale",
+    "transition_animation_scale",
+    "animator_duration_scale",
+];
+
+/// 关掉系统动画，返回原值（供 [`restore_animations`] 复原）。
+///
+/// 为什么要动设备设置：`uiautomator dump` 必须等到 UI **空闲**（idle）才拿控件树。
+/// 页面存在持续动画时（视频在播、转场没结束、无限循环动画）永远等不到 idle，
+/// dump 直接以 `ERROR: could not get idle state.` 失败，而且失败前要白等十几秒。
+/// 实测抖音推荐流（视频在播）：动画开启时 dump 3/3 失败（每次约 11.4s）；
+/// 三个 scale 置 0 后，同一页面 3/3 成功（每次约 3s）。
+/// 这是通用手段，不含任何应用专有知识，Appium/UiAutomator2 也都这么做。
+///
+/// 遍历与用例执行都该在开始前调用它 —— 用例执行的每条断言都要 dump 一次页面，
+/// 不关动画的话每次断言都要先空转十几秒再失败，重试机制会把超时耗光。
+pub fn disable_animations<D: Device + ?Sized>(d: &D) -> Vec<String> {
+    let mut prev = Vec::with_capacity(ANIM_KEYS.len());
+    for key in ANIM_KEYS {
+        let cur = d
+            .sh(
+                &format!("settings get global {}", key),
+                Duration::from_secs(10),
+            )
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        prev.push(cur);
+        let _ = d.sh(
+            &format!("settings put global {} 0", key),
+            Duration::from_secs(10),
+        );
+    }
+    prev
+}
+
+/// 恢复 [`disable_animations`] 读到的原值；读不到（空 / null）时退回系统默认 1.0。
+///
+/// 注意：进程被 `kill -9` 时来不及执行这里，设备会残留动画关闭状态。
+pub fn restore_animations<D: Device + ?Sized>(d: &D, prev: &[String]) {
+    for (key, old) in ANIM_KEYS.iter().zip(prev) {
+        let value = if old.is_empty() || old == "null" {
+            "1.0"
+        } else {
+            old.as_str()
+        };
+        let _ = d.sh(
+            &format!("settings put global {} {}", key, value),
+            Duration::from_secs(10),
+        );
+    }
+}
+
 // ------------------------------------------------------------------ 设备信息
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

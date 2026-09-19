@@ -4,7 +4,7 @@
 //! 不需要 adb 转发，因此不受 USB 传输与 adb 协议开销影响（Fastbot 的同款形态）。
 
 use super::{capture_output, Device, DEFAULT_TIMEOUT, DUMP_TIMEOUT};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::process::{Command, Stdio};
 
 /// Android 上常用的可执行文件路径
@@ -69,12 +69,28 @@ impl Device for LocalDevice {
         // 也不会像递增文件名那样在 /data/local/tmp 里堆积上千个 XML 小文件
         let path = &self.dump_path;
         let _ = std::fs::remove_file(path);
-        self.sh(
-            &format!("uiautomator dump {} >/dev/null 2>&1", path),
-            DUMP_TIMEOUT,
-        )?;
-        let s = std::fs::read_to_string(path)
-            .with_context(|| format!("读取 dump 文件失败: {}", path))?;
+        // 这里不走 self.sh()：它只返回 stdout，而 uiautomator 的失败原因写在 **stderr**
+        // （典型 `ERROR: could not get idle state.`，此时它既不生成文件、stdout 也是空的）。
+        // 只取 stdout 会把唯一线索丢成空字符串，失败就被误报成「读取 dump 文件失败」。
+        let mut c = Self::base_cmd("uiautomator");
+        c.arg("dump").arg(path);
+        let out = capture_output(&mut c, DUMP_TIMEOUT)?;
+        let so = crate::util::trim_output(String::from_utf8_lossy(&out.stdout).to_string());
+        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let said = match (so.trim().is_empty(), se.is_empty()) {
+            (true, true) => "(stdout/stderr 均为空)".to_string(),
+            (false, true) => so.clone(),
+            (true, false) => se.clone(),
+            (false, false) => format!("{} / {}", so, se),
+        };
+        let s = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => bail!(
+                "uiautomator dump 未生成文件({})；命令输出: {}",
+                e,
+                crate::util::truncate(said.trim(), 200)
+            ),
+        };
         let _ = std::fs::remove_file(path);
         if s.contains("<hierarchy") {
             Ok(s)
